@@ -69,17 +69,26 @@ title() {
 
 clear_line() { printf '%s' "$CLR"; }
 
-# Compact single-line hits; multi-line payloads indented under a heading.
+# HITS_FILE stores one TSV record per hit:
+#   <category>\t<one-line detail>\t<comma-separated versions or empty>
+# Versions are best-effort: empty when not extractable from the source.
 found() {
     mark_found
-    local cat="$1" det="$2"
-    echo "$cat" >> "$HITS_FILE"
+    local cat="$1" det="$2" ver="${3:-}"
+    local det_one="${det//$'\n'/ ; }"
+    det_one="${det_one//$'\t'/ }"
+    printf '%s\t%s\t%s\n' "$cat" "$det_one" "$ver" >> "$HITS_FILE"
+    local ver_tag=""
+    if [[ -n "$ver" ]]; then
+        local v_disp="${ver//,/, v}"
+        ver_tag=" ${DIM}(v${v_disp})${RESET}"
+    fi
     clear_line
     if [[ "$det" == *$'\n'* ]]; then
-        printf '%s[FOUND]%s %s%s%s\n' "$RED" "$RESET" "$BOLD" "$cat" "$RESET"
+        printf '%s[FOUND]%s %s%s%s%s\n' "$RED" "$RESET" "$BOLD" "$cat" "$RESET" "$ver_tag"
         printf '%s\n' "$det" | sed 's/^/        /'
     else
-        printf '%s[FOUND]%s %s%-26s%s %s\n' "$RED" "$RESET" "$BOLD" "$cat" "$RESET" "$det"
+        printf '%s[FOUND]%s %s%-26s%s %s%s\n' "$RED" "$RESET" "$BOLD" "$cat" "$RESET" "$det" "$ver_tag"
     fi
 }
 
@@ -159,6 +168,13 @@ Usage:
   $0                                # interactive
 
 Defaults: mode=both, SEARCH_ROOT=/
+
+Each hit is annotated with the resolved version(s) where extractable
+(node_modules/<pkg>/package.json, lockfiles, dist-info/egg-info, etc.).
+If anything is found and stdin is a TTY, an interactive prompt at the
+end lets you filter hits by version expression — useful when a popular
+package shows up many times but only specific releases were compromised.
+  Examples: ">=4.17.20"  "4.17.15 - 4.17.20"  "^1.2.3"  "1.2.3, 2.0.0"
 
 Exit codes:
   0  no evidence
@@ -325,6 +341,276 @@ PY
 }
 
 ############################
+# version comparison + filter
+############################
+
+re_escape() {
+    printf '%s' "$1" | sed -E 's/[][\\.^$*+?(){}|]/\\&/g'
+}
+
+# Reduce a version-ish string to "MAJOR.MINOR.PATCH".
+# Tolerates leading v / ^ / ~ / >= and trailing pre/build (-beta, +sha).
+ver_normalize() {
+    local v parts
+    v="$(printf '%s' "$1" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1)"
+    [[ -z "$v" ]] && v="0"
+    IFS=. read -ra parts <<<"$v"
+    printf '%d.%d.%d' "${parts[0]:-0}" "${parts[1]:-0}" "${parts[2]:-0}"
+}
+
+# Echo -1, 0, or 1 for compare(A, B).
+ver_cmp() {
+    local a b A B i
+    a="$(ver_normalize "$1")"
+    b="$(ver_normalize "$2")"
+    IFS=. read -ra A <<<"$a"
+    IFS=. read -ra B <<<"$b"
+    for i in 0 1 2; do
+        if (( A[i] < B[i] )); then echo -1; return; fi
+        if (( A[i] > B[i] )); then echo 1;  return; fi
+    done
+    echo 0
+}
+
+# Match $ver against one clause:
+#   1.2.3 | v1.2.3 | =1.2.3 | >X | >=X | <X | <=X | ^X | ~X | A - B
+clause_match() {
+    local ver="$1" clause="$2"
+    clause="${clause#"${clause%%[![:space:]]*}"}"
+    clause="${clause%"${clause##*[![:space:]]}"}"
+    [[ -z "$clause" ]] && return 1
+
+    # Hyphen range — require spaces so we don't trip on "1.2.3-beta".
+    if [[ "$clause" == *" - "* ]]; then
+        local lo="${clause%% - *}" hi="${clause##* - }" c1 c2
+        c1="$(ver_cmp "$ver" "$lo")"
+        c2="$(ver_cmp "$ver" "$hi")"
+        [[ "$c1" != "-1" && "$c2" != "1" ]] && return 0
+        return 1
+    fi
+
+    local op="" target="$clause"
+    case "$clause" in
+        ">="*) op=">="; target="${clause#>=}" ;;
+        "<="*) op="<="; target="${clause#<=}" ;;
+        ">"*)  op=">";  target="${clause#>}"  ;;
+        "<"*)  op="<";  target="${clause#<}"  ;;
+        "="*)  op="=";  target="${clause#=}"  ;;
+        "^"*)  op="^";  target="${clause#^}"  ;;
+        "~"*)  op="~";  target="${clause#~}"  ;;
+        *)     op="=";  target="$clause"      ;;
+    esac
+    target="${target#"${target%%[![:space:]]*}"}"
+    target="${target#v}"
+
+    local c norm T_arr hi c1 c2
+    case "$op" in
+        "=")  [[ "$(ver_cmp "$ver" "$target")" == "0"  ]] && return 0 ;;
+        ">")  [[ "$(ver_cmp "$ver" "$target")" == "1"  ]] && return 0 ;;
+        ">=") c="$(ver_cmp "$ver" "$target")"; [[ "$c" != "-1" ]] && return 0 ;;
+        "<")  [[ "$(ver_cmp "$ver" "$target")" == "-1" ]] && return 0 ;;
+        "<=") c="$(ver_cmp "$ver" "$target")"; [[ "$c" != "1"  ]] && return 0 ;;
+        "^")
+            norm="$(ver_normalize "$target")"
+            IFS=. read -ra T_arr <<<"$norm"
+            hi="$(( T_arr[0] + 1 )).0.0"
+            c1="$(ver_cmp "$ver" "$target")"
+            c2="$(ver_cmp "$ver" "$hi")"
+            [[ "$c1" != "-1" && "$c2" == "-1" ]] && return 0 ;;
+        "~")
+            norm="$(ver_normalize "$target")"
+            IFS=. read -ra T_arr <<<"$norm"
+            hi="${T_arr[0]}.$(( T_arr[1] + 1 )).0"
+            c1="$(ver_cmp "$ver" "$target")"
+            c2="$(ver_cmp "$ver" "$hi")"
+            [[ "$c1" != "-1" && "$c2" == "-1" ]] && return 0 ;;
+    esac
+    return 1
+}
+
+# Match $ver against a comma-separated expression (OR semantics).
+filter_match() {
+    local ver="$1" expr="$2" clauses c
+    IFS=, read -ra clauses <<<"$expr"
+    for c in "${clauses[@]}"; do
+        clause_match "$ver" "$c" && return 0
+    done
+    return 1
+}
+
+# Dedup + comma-join one-version-per-line on stdin.
+ver_list_join() {
+    awk 'NF && !seen[$0]++' | paste -sd ',' -
+}
+
+############################
+# version extractors
+############################
+
+# Top-level "version" of a package.json (for installed package dirs).
+pkgjson_own_version() {
+    grep -m1 -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$1" 2>/dev/null \
+        | sed -E 's/.*"([^"]+)"$/\1/'
+}
+
+# Versions of $pkg listed as a dependency in a project's package.json.
+pkgjson_dep_versions() {
+    local f="$1" pkg_re
+    pkg_re="$(re_escape "$2")"
+    grep -oE "\"${pkg_re}\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" "$f" 2>/dev/null \
+        | sed -E 's/.*"([^"]+)"$/\1/' \
+        | awk 'NF && !seen[$0]++'
+}
+
+# Resolved versions of $pkg from an npm package-lock.json / npm-shrinkwrap.json.
+# Uses python3 if available (handles both v1 and v2+ layouts); falls back to a
+# coarse "find version: near a key matching pkg" grep otherwise.
+nlock_versions() {
+    local f="$1" pkg="$2"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$f" "$pkg" <<'PY' 2>/dev/null
+import json, sys
+f, pkg = sys.argv[1], sys.argv[2]
+try:
+    with open(f) as fp:
+        data = json.load(fp)
+except Exception:
+    sys.exit(0)
+versions = set()
+# v2+: "packages": { "node_modules/foo": {...}, "node_modules/a/node_modules/foo": {...} }
+for k, v in (data.get("packages") or {}).items():
+    if not k or not isinstance(v, dict):
+        continue
+    parts = k.split("/")
+    name = None
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i] == "node_modules" and i + 1 < len(parts):
+            name = "/".join(parts[i+1:])
+            break
+    if name == pkg and "version" in v:
+        versions.add(v["version"])
+# v1: nested "dependencies"
+def walk(d):
+    if not isinstance(d, dict):
+        return
+    for k, v in d.items():
+        if isinstance(v, dict):
+            if k == pkg and "version" in v:
+                versions.add(v["version"])
+            walk(v.get("dependencies"))
+walk(data.get("dependencies"))
+for v in sorted(versions):
+    print(v)
+PY
+    else
+        local pkg_re
+        pkg_re="$(re_escape "$pkg")"
+        grep -A4 -E "\"(node_modules/)?${pkg_re}\"[[:space:]]*:" "$f" 2>/dev/null \
+            | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' \
+            | sed -E 's/.*"([^"]+)"$/\1/'
+    fi
+}
+
+# Resolved versions of $pkg from a yarn.lock.
+# yarn.lock blocks look like:
+#   "pkg@^1.2.3", "pkg@^1.4.0":
+#     version "1.4.2"
+ylock_versions() {
+    local f="$1" pkg="$2"
+    awk -v pkg="$pkg" '
+        function header_has_pkg(line,    s) {
+            gsub(/[",]/, " ", line)
+            s = " " line " "
+            return index(s, " " pkg "@") > 0
+        }
+        /^[^[:space:]]/ { in_block = header_has_pkg($0) }
+        in_block && $1 == "version" {
+            v = $2; gsub(/"/, "", v); print v
+        }
+    ' "$f" 2>/dev/null
+}
+
+# Resolved versions of $pkg from a pnpm-lock.yaml (best-effort).
+plock_versions() {
+    local f="$1" pkg="$2" pkg_re
+    pkg_re="$(re_escape "$pkg")"
+    # pnpm v5/v6: "/pkg/X.Y.Z:"     pnpm v9: "pkg@X.Y.Z:"
+    grep -oE "(/${pkg_re}/|^[[:space:]]+'?${pkg_re}@|^${pkg_re}@)[0-9][^:'\"[:space:]]*" "$f" 2>/dev/null \
+        | sed -E "s|.*/${pkg_re}/||; s|.*${pkg_re}@||; s|_.*||"
+}
+
+npm_manifest_versions() {
+    local f="$1" pkg="$2"
+    case "${f##*/}" in
+        package-lock.json|npm-shrinkwrap.json)
+            nlock_versions "$f" "$pkg" | ver_list_join ;;
+        yarn.lock)
+            ylock_versions "$f" "$pkg" | ver_list_join ;;
+        pnpm-lock.yaml)
+            plock_versions "$f" "$pkg" | ver_list_join ;;
+        package.json)
+            pkgjson_dep_versions "$f" "$pkg" | ver_list_join ;;
+        *) : ;;
+    esac
+}
+
+# Version embedded in a python metadata dir name, e.g.
+#   lodash-4.17.21.dist-info   ->  4.17.21
+#   lodash-4.17.21-py3.10.egg-info  ->  4.17.21
+py_meta_version() {
+    local d="$1" v="$2"
+    local base="${d##*/}"
+    base="${base%.dist-info}"
+    base="${base%.egg-info}"
+    base="${base#${v}-}"
+    base="${base#${v}}"
+    base="${base%%-py[0-9]*}"
+    printf '%s' "$base"
+}
+
+# Adjacent dist-info / egg-info for a bare python package dir.
+py_pkg_dir_version() {
+    local d="$1" v="$2"
+    local parent="${d%/*}" m
+    for m in "$parent/${v}-"*.dist-info "$parent/${v}-"*.egg-info "$parent/${v}.egg-info"; do
+        if [[ -d "$m" ]]; then
+            py_meta_version "$m" "$v"
+            return
+        fi
+    done
+}
+
+# requirements.txt / Pipfile / poetry.lock / setup.* (best-effort).
+req_versions() {
+    local f="$1" pkg_re
+    pkg_re="$(re_escape "$2")"
+    grep -iE "^[[:space:]]*${pkg_re}[[:space:]]*(==|>=|<=|~=|>|<|!=)" "$f" 2>/dev/null \
+        | sed -E "s/^[[:space:]]*${pkg_re}[[:space:]]*(==|>=|<=|~=|>|<|!=)[[:space:]]*//I" \
+        | sed -E 's/[[:space:];,#].*$//'
+}
+
+pyproject_versions() {
+    local f="$1" pkg_re
+    pkg_re="$(re_escape "$2")"
+    {
+        # poetry-style:   pkg = "^1.2.3"   or   pkg = "1.2.3"
+        grep -iE "^[[:space:]]*${pkg_re}[[:space:]]*=[[:space:]]*\"[^\"]+\"" "$f" 2>/dev/null \
+            | sed -E 's/.*"([^"]+)"$/\1/'
+        # PEP 621:         "pkg==1.2.3"   or   "pkg>=1.2.3"
+        grep -oE "[\"']${pkg_re}[[:space:]]*(==|>=|<=|~=|>|<|!=)[^,\"']+" "$f" 2>/dev/null \
+            | sed -E "s/.*${pkg_re}[[:space:]]*(==|>=|<=|~=|>|<|!=)[[:space:]]*//"
+    }
+}
+
+py_manifest_versions() {
+    local f="$1" pkg="$2"
+    case "${f##*/}" in
+        pyproject.toml) pyproject_versions "$f" "$pkg" | ver_list_join ;;
+        *)              req_versions       "$f" "$pkg" | ver_list_join ;;
+    esac
+}
+
+############################
 # Phase 1 - filesystem walk
 ############################
 
@@ -383,13 +669,16 @@ printf '       %s%-22s%s %d\n' "$DIM" "python manifests:"   "$RESET" "${#PY_MANI
 
 check_npm() {
     title "Phase 2  -  NPM"
+    local out ver pkg_re
+    pkg_re="$(re_escape "$PACKAGE")"
 
     if command -v npm >/dev/null 2>&1; then
         log "npm ls (current working dir)..."
-        local out
         if out="$(npm ls "$PACKAGE" --all 2>/dev/null)" \
             && grep -qi -- "$PACKAGE" <<<"$out"; then
-            found "npm ls (current project)" "$(head -n 30 <<<"$out")"
+            ver="$(printf '%s\n' "$out" | grep -oE -- "${pkg_re}@[^[:space:]]+" \
+                    | sed -E "s/.*${pkg_re}@//" | ver_list_join)"
+            found "npm ls (current project)" "$(head -n 30 <<<"$out")" "$ver"
         else
             ok "npm ls: not present in current project"
         fi
@@ -405,9 +694,17 @@ check_npm() {
             ((i++)) || true
             progress "$i" "$total" "npm dirs"
             for v in "${VARIANTS[@]}"; do
-                [[ -d "$d/$v" ]] && found "npm package dir" "$d/$v"
+                if [[ -d "$d/$v" ]]; then
+                    ver=""
+                    [[ -f "$d/$v/package.json" ]] && ver="$(pkgjson_own_version "$d/$v/package.json")"
+                    found "npm package dir" "$d/$v" "$ver"
+                fi
                 for hit in "$d"/@*/"$v"; do
-                    [[ -d "$hit" ]] && found "npm scoped package dir" "$hit"
+                    if [[ -d "$hit" ]]; then
+                        ver=""
+                        [[ -f "$hit/package.json" ]] && ver="$(pkgjson_own_version "$hit/package.json")"
+                        found "npm scoped package dir" "$hit" "$ver"
+                    fi
                 done
             done
         done
@@ -423,7 +720,8 @@ check_npm() {
             ((i++)) || true
             progress "$i" "$total" "npm manifests"
             if grep -Fqi -- "$PACKAGE" "$f" 2>/dev/null; then
-                found "npm manifest ref" "$f"
+                ver="$(npm_manifest_versions "$f" "$PACKAGE")"
+                found "npm manifest ref" "$f" "$ver"
             fi
         done
         clear_line
@@ -437,20 +735,25 @@ check_npm() {
 
 check_python() {
     title "Phase 3  -  Python"
+    local py out ver detail pkg_re
+    pkg_re="$(re_escape "$PACKAGE")"
 
-    local py out
     while read -r py; do
         [[ -z "$py" ]] && continue
         log "pip show via $py..."
         if out="$("$py" -m pip show "$PACKAGE" 2>/dev/null)" && [[ -n "$out" ]]; then
-            found "pip installed ($py)" "$out"
+            ver="$(printf '%s\n' "$out" | awk -F': *' 'tolower($1)=="version"{print $2; exit}')"
+            found "pip installed ($py)" "$out" "$ver"
         fi
     done < <(python_interpreters | awk 'NF && !seen[$0]++')
 
     if command -v pipx >/dev/null 2>&1; then
         log "pipx list..."
         if pipx list --short 2>/dev/null | grep -qi -- "$PACKAGE"; then
-            found "pipx installed" "$(pipx list 2>/dev/null | grep -i -- "$PACKAGE" || true)"
+            detail="$(pipx list 2>/dev/null | grep -i -- "$PACKAGE" || true)"
+            ver="$(printf '%s\n' "$detail" | grep -oiE "${pkg_re}[[:space:]]+[0-9][^[:space:],]*" \
+                    | awk '{print $NF}' | ver_list_join)"
+            found "pipx installed" "$detail" "$ver"
         fi
     fi
 
@@ -462,9 +765,15 @@ check_python() {
             ((i++)) || true
             progress "$i" "$total" "python dirs"
             for v in "${VARIANTS[@]}"; do
-                [[ -d "$d/$v" ]] && found "python package dir" "$d/$v"
+                if [[ -d "$d/$v" ]]; then
+                    ver="$(py_pkg_dir_version "$d/$v" "$v")"
+                    found "python package dir" "$d/$v" "$ver"
+                fi
                 for hit in "$d/${v}-"*.dist-info "$d/${v}-"*.egg-info "$d/${v}.egg-info"; do
-                    [[ -d "$hit" ]] && found "python metadata dir" "$hit"
+                    if [[ -d "$hit" ]]; then
+                        ver="$(py_meta_version "$hit" "$v")"
+                        found "python metadata dir" "$hit" "$ver"
+                    fi
                 done
             done
         done
@@ -480,7 +789,8 @@ check_python() {
             ((i++)) || true
             progress "$i" "$total" "python manifests"
             if grep -Fqi -- "$PACKAGE" "$f" 2>/dev/null; then
-                found "python manifest ref" "$f"
+                ver="$(py_manifest_versions "$f" "$PACKAGE")"
+                found "python manifest ref" "$f" "$ver"
             fi
         done
         clear_line
@@ -553,12 +863,91 @@ printf '  %s%-16s%s %s%d / %d hits%s   %s[%s]%s\n' \
 if (( total_hits > 0 )); then
     echo
     printf '  %sBy category:%s\n' "$BOLD" "$RESET"
-    # Tab-separate count and category so `read` can split them even with IFS=$'\n\t'.
-    awk '{c[$0]++} END {for (k in c) printf "%d\t%s\n", c[k], k}' "$HITS_FILE" \
+    # First field is category in our TSV layout.
+    awk -F'\t' '{c[$1]++} END {for (k in c) printf "%d\t%s\n", c[k], k}' "$HITS_FILE" \
         | sort -rn \
         | while IFS=$'\t' read -r n c; do
             printf '    %-32s %s%4d%s\n' "$c" "$YELLOW" "$n" "$RESET"
         done
+fi
+
+############################
+# Interactive version filter
+############################
+
+apply_filter() {
+    local expr="$1"
+    local matched=0 unknown=0 total=0
+    local cat det ver vlist v hit hit_ver extra other_list
+    title "Filter: ${expr}"
+    while IFS=$'\t' read -r cat det ver; do
+        ((total++)) || true
+        if [[ -z "$ver" ]]; then
+            ((unknown++)) || true
+            continue
+        fi
+        hit=0; hit_ver=""
+        IFS=, read -ra vlist <<<"$ver"
+        for v in "${vlist[@]}"; do
+            if filter_match "$v" "$expr"; then
+                hit_ver="$v"
+                hit=1
+                break
+            fi
+        done
+        if (( hit )); then
+            ((matched++)) || true
+            extra=""
+            if (( ${#vlist[@]} > 1 )); then
+                other_list=""
+                for v in "${vlist[@]}"; do
+                    [[ "$v" == "$hit_ver" ]] && continue
+                    other_list="${other_list:+$other_list, }v$v"
+                done
+                extra=" ${DIM}(other versions seen: ${other_list})${RESET}"
+            fi
+            printf '  %s[MATCH]%s %s(v%s)%s %s%-26s%s %s%s\n' \
+                "$RED" "$RESET" "$YELLOW" "$hit_ver" "$RESET" "$BOLD" "$cat" "$RESET" "$det" "$extra"
+        fi
+    done < "$HITS_FILE"
+    echo
+    if (( matched == 0 )); then
+        ok "No hits match '${expr}'  (${unknown} of ${total} had no extractable version)"
+    elif (( unknown > 0 )); then
+        warn "${matched} of ${total} hit(s) match '${expr}'  (${unknown} excluded - no extractable version)"
+    else
+        warn "${matched} of ${total} hit(s) match '${expr}'"
+    fi
+}
+
+if (( total_hits > 0 )) && [[ -t 0 ]]; then
+    title "Version Filter"
+    cat <<EOF
+  Hits include version numbers where extractable. Narrow them down with
+  an expression (takeovers are often scoped to a small release window):
+
+    1.2.3                exact
+    v1.2.3               exact (v-prefix tolerated)
+    >=4.17.20            operators:  >  >=  <  <=
+    4.17.15 - 4.17.20    inclusive range (spaces required around the hyphen)
+    ^1.2.3               >=1.2.3, < next major
+    ~1.2.3               >=1.2.3, < next minor
+    4.17.15, >=5.0.0     comma-separated (OR)
+
+  Hits without an extractable version are excluded from filtered output.
+  Press Enter on a blank line to exit.
+EOF
+    while :; do
+        echo
+        if ! read -rp "  filter> " filter_expr; then
+            echo
+            break
+        fi
+        filter_expr="${filter_expr#"${filter_expr%%[![:space:]]*}"}"
+        filter_expr="${filter_expr%"${filter_expr##*[![:space:]]}"}"
+        [[ -z "$filter_expr" ]] && break
+        apply_filter "$filter_expr"
+    done
 fi
 
 echo
