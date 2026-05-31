@@ -174,6 +174,12 @@ The plan must include:
 
 Keep it concise and skimmable. Output ONLY the plan in GitHub-flavored markdown.
 
+If this issue is ALREADY RESOLVED, a clear DUPLICATE, genuinely NOT NEEDED,
+completely OUT OF SCOPE for this repository, or otherwise not actionable by an
+engineer, do NOT produce a work plan. Instead, output a single line:
+REJECT: <concise reason (≤ 120 chars)>
+Keep the bar HIGH — reject only when clearly warranted.
+
 --- ISSUE: ${title} ---
 ${body}
 EOF
@@ -312,6 +318,23 @@ action_propose_plan() {
   local plan
   plan="$(run_claude "$model" "$(plan_prompt "$title" "$body")")" || { warn "#$num: plan generation failed"; return 1; }
   [[ -n "$plan" ]] || { warn "#$num: empty plan, skipping"; return 1; }
+
+  # Check for rejection sentinel (first line only, for unambiguous matching).
+  local firstline
+  firstline="$(head -n1 <<<"$plan")"
+  if [[ "$firstline" == REJECT:* ]]; then
+    local reason="${firstline#REJECT:}"
+    reason="${reason#"${reason%%[! ]*}"}"   # ltrim whitespace
+    post_comment "$num" "## 🚫 Issue not actioned
+
+**Reason:** ${reason}
+
+Add \`${LABEL_APPROVED}\` to override and force a work plan, or remove \`${BOT_LABEL}\` and \`${LABEL_PLAN}\` labels to fully reset."
+    add_label "$num" "$LABEL_HALTED"
+    ok "#$num: rejected — '$reason'; labelled '$LABEL_HALTED'"
+    return 0
+  fi
+
   post_comment "$num" "## 🤖 Proposed work plan
 
 ${plan}
