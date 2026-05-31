@@ -232,12 +232,20 @@ run_claude() {
     echo "[dry-run plan placeholder]"
     return 0
   fi
-  local out
+  local out errfile rc
+  errfile="$(mktemp)"
   out="$(printf '%s' "$prompt" | claude -p \
         --model "$model" \
         --permission-mode bypassPermissions \
         --max-turns "$CLAUDE_MAX_TURNS" \
-        --output-format json 2>/dev/null)" || { err "claude invocation failed"; return 1; }
+        --output-format json 2>"$errfile")"
+  rc=$?
+  if (( rc != 0 )); then
+    err "claude invocation failed (exit $rc): $(tr '\n' ' ' <"$errfile" | head -c 500)"
+    rm -f "$errfile"
+    return 1
+  fi
+  rm -f "$errfile"
   if [[ "$(jq -r '.is_error // false' <<<"$out" 2>/dev/null)" == "true" ]]; then
     err "claude reported an error: $(jq -r '.result // .error // "unknown"' <<<"$out")"
     return 1
@@ -500,6 +508,22 @@ service_unit() { echo "$HOME/.config/systemd/user/$(service_name).service"; }
 
 service_running() { systemctl --user is-active --quiet "$(service_name).service" 2>/dev/null; }
 
+# systemd user services start with a minimal PATH (no ~/.local/bin, no nvm),
+# so `claude` and friends aren't found at runtime. Build a PATH from the
+# install-time locations of the tools we shell out to, then the system dirs.
+service_path() {
+  local t d p seen="" out=""
+  for p in "$(command -v claude)" "$(command -v gh)" "$(command -v git)" \
+           "$(command -v jq)" "$(command -v flock)" "$(command -v node)"; do
+    [[ -n "$p" ]] || continue
+    d="$(dirname "$p")"
+    case ":$seen:" in *":$d:"*) continue ;; esac
+    seen="${seen:+$seen:}$d"; out="${out:+$out:}$d"
+  done
+  out="${out:+$out:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  printf '%s' "$out"
+}
+
 write_unit() {
   local unit; unit="$(service_unit)"
   mkdir -p "$(dirname "$unit")"
@@ -515,6 +539,7 @@ ExecStart=$SCRIPT_PATH loop
 Restart=always
 RestartSec=15
 Environment=AUTO_ISSUE_ENV_FILE=$ENV_FILE
+Environment=PATH=$(service_path)
 
 [Install]
 WantedBy=default.target
@@ -566,6 +591,30 @@ cmd_status_service() {
 cmd_logs() {
   require_repo
   journalctl --user -u "$(service_name).service" -f --no-hostname
+}
+
+# List every auto-issue service on this machine (any repo), with its state and
+# working directory. Does not require being inside a repo.
+cmd_list_services() {
+  local units
+  units="$(systemctl --user list-unit-files 'auto-issue-*.service' --no-legend 2>/dev/null | awk '{print $1}')"
+  if [[ -z "$units" ]]; then
+    info "No auto-issue services installed on this machine."
+    return 0
+  fi
+  printf '%-26s %-10s %s\n' "SERVICE" "STATE" "DIRECTORY"
+  local u state dir color
+  while read -r u; do
+    [[ -n "$u" ]] || continue
+    state="$(systemctl --user is-active "$u" 2>/dev/null)"
+    dir="$(systemctl --user show "$u" -p WorkingDirectory --value 2>/dev/null)"
+    case "$state" in
+      active)   color="$c_grn" ;;
+      failed)   color="$c_red" ;;
+      *)        color="$c_dim" ;;
+    esac
+    printf '%-26s %s%-10s%s %s\n' "${u%.service}" "$color" "$state" "$c_reset" "$dir"
+  done <<<"$units"
 }
 
 # ---------------------------------------------------------------------------
@@ -755,7 +804,8 @@ USAGE
 
   auto-issue start           Start (or replace) the background service for this repo
   auto-issue stop            Stop the background service
-  auto-issue status          Show background service status
+  auto-issue status          Show this repo's background service status
+  auto-issue list            List ALL auto-issue services on this machine (any repo)
   auto-issue logs            Follow background service logs
   auto-issue disable         Stop and remove the background service
 
@@ -782,6 +832,7 @@ main() {
     start)         cmd_start_service ;;
     stop)          cmd_stop_service ;;
     status)        cmd_status_service ;;
+    list|ls|ps)    cmd_list_services ;;
     logs)          cmd_logs ;;
     disable|destroy) cmd_disable_service ;;
     setup)         cmd_setup ;;
