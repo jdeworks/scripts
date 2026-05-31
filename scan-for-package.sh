@@ -5,6 +5,8 @@ set -uEo pipefail
 IFS=$'\n\t'
 shopt -s nullglob
 
+VERSION="1.0.0"
+
 ############################
 # state / cleanup
 ############################
@@ -179,6 +181,8 @@ package shows up many times but only specific releases were compromised.
 Exit codes:
   0  no evidence
   3  evidence found
+
+Version: $VERSION
 EOF
 }
 
@@ -190,6 +194,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -m|--mode) MODE="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
+        --version) echo "scan-for-package.sh $VERSION"; exit 0 ;;
         --) shift; break ;;
         -*) err "unknown flag: $1"; usage; exit 2 ;;
         *)
