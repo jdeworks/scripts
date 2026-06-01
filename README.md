@@ -54,7 +54,8 @@ The guided wizard:
 
 - checks dependencies (`git`, `gh`, `claude`, `jq`, `flock`),
 - walks you through creating a **fine-grained GitHub PAT** for the repo owner's account, with **Issues / Contents / Pull requests = Read and write** (Metadata read is automatic), and offers to save it to `~/.auto-issue.env` (`chmod 600`),
-- installs the `auto-issue` command into `~/.local/bin` so it runs from any GitHub folder.
+- installs the `auto-issue` command into `~/.local/bin` so it runs from any GitHub folder,
+- offers to register the current repo in the global registry (`~/.auto-issue/repos`).
 
 > **Token vs. git:** `gh` (issues, labels, PRs) authenticates with `AUTO_ISSUE_GH_TOKEN`; `git push` uses your normal SSH/credentials. The PAT must be scoped to the **repo owner's** account — an outside collaborator token only has read access and the bot's writes will fail. Verify with:
 > ```bash
@@ -63,29 +64,44 @@ The guided wizard:
 
 #### Running it
 
+A single global daemon monitors all repos you register. Start by registering at least one:
+
 ```bash
-auto-issue            # interactive: shows config, then choose foreground or background
-auto-issue info       # show resolved configuration (read-only)
-auto-issue once       # run a single poll cycle and exit
-auto-issue loop       # run the polling loop in the foreground (Ctrl-C to stop)
+auto-issue register              # register the current directory's repo
+auto-issue register /path/to/repo  # register a specific path
+auto-issue unregister            # unregister the current repo
+auto-issue repos                 # list registered repos and service state
 ```
 
-Running `auto-issue` with no arguments prints the current configuration and asks how to run:
+Then run the bot:
+
+```bash
+auto-issue            # interactive: shows config, then choose foreground or background
+auto-issue info       # show resolved configuration and registered repos (read-only)
+auto-issue once       # run a single poll cycle across all registered repos and exit
+auto-issue loop       # run the polling loop in the foreground (Ctrl-C to stop)
+auto-issue list       # show service state and all registered repos
+auto-issue labels     # create/refresh workflow labels in the current repo
+```
+
+Running `auto-issue` with no arguments prints the current configuration and asks how to run. If no repos are registered yet and you're inside a GitHub repo, it offers to register it on the spot:
 
 - **Foreground** — runs in your terminal; recommended for the first try.
-- **Background** — installs a systemd **user service** named `auto-issue-<foldername>` with auto-restart. If one is already running for the repo it's replaced (handy for config changes). Boot autostart needs lingering, which setup enables when possible.
+- **Background** — installs a single global systemd **user service** named `auto-issue` that monitors all registered repos. If the service is already running it's replaced (handy for config changes). Boot autostart needs lingering, which setup enables when possible.
+
+> **Note:** `once`, `loop`, and the interactive no-arg flow all require at least one registered repo. Run `auto-issue register` first.
 
 #### Background service management
 
 ```bash
-auto-issue start      # start (or replace) the background service for this repo
+auto-issue start      # start (or replace) the global background service
 auto-issue status     # service status
 auto-issue logs       # follow the service logs
 auto-issue stop       # stop the service
 auto-issue disable    # stop and remove the service entirely
 ```
 
-To enable start-on-boot manually (if the bot couldn't): `loginctl enable-linger "$USER"`.
+One service (`auto-issue.service`) covers all registered repos. To enable start-on-boot manually (if the bot couldn't): `loginctl enable-linger "$USER"`.
 
 #### Testing
 
@@ -93,7 +109,7 @@ To enable start-on-boot manually (if the bot couldn't): `loginctl enable-linger 
 DRY_RUN=1 auto-issue once   # log every action without spawning Claude or mutating anything
 ```
 
-`DRY_RUN=1` lists exactly which plans it would write, which labels it would change, and which builds it would run — safe to run against a live repo.
+`DRY_RUN=1` lists exactly which plans it would write, which labels it would change, and which builds it would run — safe to run against a live repo. Requires at least one registered repo (`auto-issue register` first).
 
 #### Configuration
 
