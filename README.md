@@ -103,7 +103,9 @@ Set in `~/.auto-issue.env` or the environment. Defaults in **bold**.
 |---|---|---|
 | `AUTO_ISSUE_GH_TOKEN` | — | **Required.** Write-capable PAT for `gh`. |
 | `BOT_LABEL` | **`bot`** | Trigger label. Empty string = process *all* open issues. |
-| `INTERVAL` | **`5`** | Minutes between polls. |
+| `INTERVAL_MIN` | **`1`** | Minimum minutes between polls — used after the bot does work. |
+| `INTERVAL_MAX` | **`20`** | Maximum backoff ceiling (minutes) during idle periods. |
+| `BACKOFF_FACTOR` | **`2`** | Multiply the sleep interval by this factor each idle round. |
 | `MAX_PER_CYCLE` | **`10`** | Max Claude actions per cycle (the rest wait for the next poll). |
 | `COOLDOWN` | **`20`** | Seconds between Claude invocations (rate-limit friendliness). |
 | `MODEL_DEFAULT` | **`sonnet`** | Model for plan/build. |
@@ -115,4 +117,4 @@ Set in `~/.auto-issue.env` or the environment. Defaults in **bold**.
 | `CLAUDE_MAX_TURNS` | **`40`** | Max turns per Claude run. |
 | `DRY_RUN` | **`0`** | `1` = simulate, never spawn Claude or mutate. |
 
-The bot creates a `.auto-issue/` directory (added to `.gitignore`) for its lock and last-check timestamp. Claude runs unattended with `--permission-mode bypassPermissions`; only point it at repos you trust it to modify.
+The bot uses an **adaptive polling interval**: it first issues a cheap GitHub API probe (`since=<last-check>`) to see if any issues changed. If nothing changed it backs off exponentially (up to `INTERVAL_MAX` minutes); as soon as work is detected or done the sleep resets to `INTERVAL_MIN`. State (last-check timestamp, per-repo action counts) lives in `~/.auto-issue/state/`. Claude runs unattended with `--permission-mode bypassPermissions`; only point it at repos you trust it to modify.
