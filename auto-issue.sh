@@ -7,8 +7,8 @@
 # open a PR, merge it, and close the issue. State lives in GitHub labels so it
 # works from anywhere you have GitHub access.
 #
-# Run `auto-issue` (no args) inside any GitHub folder for the interactive
-# launcher. See README.md for the full guide.
+# Run `auto-issue setup` once, then `auto-issue register` inside each repo you
+# want to enable. A single global loop / systemd service handles all repos.
 
 set -uo pipefail
 
@@ -63,11 +63,17 @@ DRY_RUN="${DRY_RUN:-0}"            # 1 => log actions, never spawn Claude or mut
 # apart from human instructions regardless of which account posts them.
 BOT_MARKER="<!-- auto-issue-bot -->"
 
-# Populated at runtime.
-REPO=""              # owner/name
+# ---------------------------------------------------------------------------
+# Global config dir (user-space, not per-repo).
+# ---------------------------------------------------------------------------
+GLOBAL_DIR="$HOME/.auto-issue"
+REGISTRY="$GLOBAL_DIR/repos"
+
+# Populated at runtime by detect_repo.
+REPO=""
 DEFAULT_BRANCH=""
 REPO_ROOT=""
-STATE_DIR=""
+STATE_DIR=""  # set per-repo inside run_cycle_for_repo
 
 # ---------------------------------------------------------------------------
 # Output helpers.
@@ -94,17 +100,18 @@ setup_gh_auth() {
   fi
 }
 
-# Confirm we are inside a git repo that gh recognises as a GitHub repo.
+# Confirm a path is inside a git repo that gh recognises as a GitHub repo.
+# Accepts an optional path argument (default: $PWD).
 # Sets REPO, DEFAULT_BRANCH, REPO_ROOT. Returns non-zero otherwise.
 detect_repo() {
-  REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  local path="${1:-$PWD}"
+  REPO_ROOT="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" || return 1
   local json
-  json="$(gh repo view --json nameWithOwner,defaultBranchRef 2>/dev/null)" || return 1
+  json="$(cd "$REPO_ROOT" && gh repo view --json nameWithOwner,defaultBranchRef 2>/dev/null)" || return 1
   REPO="$(jq -r '.nameWithOwner // empty' <<<"$json")"
   DEFAULT_BRANCH="$(jq -r '.defaultBranchRef.name // empty' <<<"$json")"
   [[ -n "$REPO" ]] || return 1
   [[ -n "$TARGET_BRANCH" ]] || TARGET_BRANCH="$DEFAULT_BRANCH"
-  STATE_DIR="$REPO_ROOT/.auto-issue"
   return 0
 }
 
@@ -121,16 +128,25 @@ token_can_write() {
 }
 
 # ---------------------------------------------------------------------------
-# State dir + gitignore + labels.
+# Global state dir helpers (replaces per-repo .auto-issue/).
 # ---------------------------------------------------------------------------
-ensure_state_dir() {
-  mkdir -p "$STATE_DIR"
-  local gi="$REPO_ROOT/.gitignore"
-  if [[ ! -f "$gi" ]] || ! grep -qxF '.auto-issue/' "$gi" 2>/dev/null; then
-    printf '%s\n' '.auto-issue/' >>"$gi"
-    info "Added .auto-issue/ to .gitignore"
-  fi
+
+# Create the global config dir and state subdir.
+ensure_global_dir() {
+  mkdir -p "$GLOBAL_DIR/state"
 }
+
+# Return the per-repo state dir for the given REPO_ROOT path.
+global_state_dir() {
+  local rroot="$1"
+  local slug
+  slug="$(printf '%s' "$rroot" | tr '/' '_')"
+  printf '%s/state/%s' "$GLOBAL_DIR" "$slug"
+}
+
+# ---------------------------------------------------------------------------
+# Labels.
+# ---------------------------------------------------------------------------
 
 # label name|color|description
 managed_labels() {
@@ -432,7 +448,7 @@ PR: ${pr_url}"
 }
 
 # ---------------------------------------------------------------------------
-# One poll cycle.
+# One poll cycle (runs in the CWD repo context set by run_cycle_for_repo).
 # ---------------------------------------------------------------------------
 run_cycle() {
   local label_args=()
@@ -487,48 +503,154 @@ run_cycle() {
 }
 
 # ---------------------------------------------------------------------------
+# Run one poll cycle for a given repo path.
+# Runs in a subshell so CWD changes and variable mutations don't leak.
+# ---------------------------------------------------------------------------
+run_cycle_for_repo() {
+  local rpath="$1"
+  (
+    cd "$rpath" || { warn "cannot cd to '$rpath'"; return 1; }
+    detect_repo || { warn "cannot detect repo at '$rpath'; is it a GitHub repository?"; return 1; }
+
+    STATE_DIR="$(global_state_dir "$REPO_ROOT")"
+    mkdir -p "$STATE_DIR"
+    ensure_labels
+
+    info "==> repo: ${c_bold}$REPO${c_reset} ($REPO_ROOT)"
+    token_can_write || warn "active token cannot push to $REPO — builds/labels will fail. Fix AUTO_ISSUE_GH_TOKEN."
+    run_cycle
+  )
+}
+
+# ---------------------------------------------------------------------------
 # Loop runner (foreground; also the systemd ExecStart target).
 # ---------------------------------------------------------------------------
 cmd_loop() {
-  require_repo
-  ensure_state_dir
-  ensure_labels
-  info "auto-issue loop started for ${c_bold}$REPO${c_reset} — interval ${INTERVAL}m, target '$TARGET_BRANCH'"
-  token_can_write || warn "active token cannot push to $REPO — builds/labels will fail. Fix AUTO_ISSUE_GH_TOKEN."
+  setup_gh_auth
+  ensure_global_dir
+  [[ -s "$REGISTRY" ]] || die "No repos registered. Run: auto-issue register"
+
+  info "auto-issue global loop started — interval ${INTERVAL}m"
+  while IFS= read -r rpath; do
+    [[ -n "$rpath" ]] && info "  registered: $rpath"
+  done < "$REGISTRY"
+
   trap 'echo; warn "stopping auto-issue loop"; exit 0' INT TERM
   while true; do
-    # Per-repo lock so two runners never overlap in the same working tree.
     (
       flock -n 9 || { warn "another auto-issue runner holds the lock; skipping cycle"; exit 0; }
-      run_cycle
-    ) 9>"$STATE_DIR/lock"
+      while IFS= read -r rpath; do
+        [[ -n "$rpath" ]] || continue
+        [[ -d "$rpath" ]] || { warn "registered path missing: $rpath"; continue; }
+        run_cycle_for_repo "$rpath"
+      done < "$REGISTRY"
+    ) 9>"$GLOBAL_DIR/lock"
     info "sleeping ${INTERVAL}m"
     sleep "$(( INTERVAL * 60 ))"
   done
 }
 
 cmd_once() {
-  require_repo
-  ensure_state_dir
-  ensure_labels
-  info "auto-issue single cycle for ${c_bold}$REPO${c_reset}${DRY_RUN:+ (DRY_RUN=$DRY_RUN)}"
-  token_can_write || warn "active token cannot push to $REPO — builds/labels will fail."
+  setup_gh_auth
+  ensure_global_dir
+  [[ -s "$REGISTRY" ]] || die "No repos registered. Run: auto-issue register"
+
+  info "auto-issue single cycle${DRY_RUN:+ (DRY_RUN=$DRY_RUN)}"
   (
     flock -n 9 || die "another auto-issue runner holds the lock"
-    run_cycle
-  ) 9>"$STATE_DIR/lock"
+    while IFS= read -r rpath; do
+      [[ -n "$rpath" ]] || continue
+      [[ -d "$rpath" ]] || { warn "registered path missing: $rpath"; continue; }
+      run_cycle_for_repo "$rpath"
+    done < "$REGISTRY"
+  ) 9>"$GLOBAL_DIR/lock"
 }
 
 # ---------------------------------------------------------------------------
-# systemd user service management.
+# Registry management.
 # ---------------------------------------------------------------------------
-service_name() {
-  local base; base="$(basename "$REPO_ROOT")"
-  base="$(printf '%s' "$base" | tr -c 'A-Za-z0-9_.-' '-')"
-  echo "auto-issue-${base}"
-}
-service_unit() { echo "$HOME/.config/systemd/user/$(service_name).service"; }
+cmd_register() {
+  local path="${1:-$PWD}"
+  [[ -n "$path" ]] || path="$PWD"
+  path="$(readlink -f "$path")"
+  setup_gh_auth
 
+  detect_repo "$path" || die "Not a GitHub repository at '$path'"
+  ensure_global_dir
+
+  # Check if already registered.
+  if [[ -f "$REGISTRY" ]] && grep -qxF "$REPO_ROOT" "$REGISTRY"; then
+    ok "$REPO ($REPO_ROOT) is already registered"
+    return 0
+  fi
+
+  printf '%s\n' "$REPO_ROOT" >> "$REGISTRY"
+  ok "registered $REPO ($REPO_ROOT)"
+
+  if prompt_yn "Create/refresh workflow labels in $REPO now?" y; then
+    ensure_labels
+  fi
+
+  # Migration: warn about old per-repo state dir.
+  if [[ -d "$REPO_ROOT/.auto-issue" ]]; then
+    warn "Found old per-repo state dir: $REPO_ROOT/.auto-issue"
+    warn "You can safely remove it:  rm -rf $REPO_ROOT/.auto-issue"
+  fi
+
+  # Migration: warn about old per-repo systemd service.
+  local old_svc; old_svc="auto-issue-$(printf '%s' "$(basename "$REPO_ROOT")" | tr -c 'A-Za-z0-9_.-' '-')"
+  if systemctl --user is-enabled "${old_svc}.service" >/dev/null 2>&1 \
+     || systemctl --user is-active "${old_svc}.service" >/dev/null 2>&1; then
+    warn "Old per-repo service '${old_svc}' is still installed."
+    warn "Disable it to avoid double-processing:"
+    warn "  systemctl --user disable --now ${old_svc}.service"
+  fi
+}
+
+cmd_unregister() {
+  local path="${1:-$PWD}"
+  [[ -n "$path" ]] || path="$PWD"
+  path="$(readlink -f "$path")"
+
+  # Resolve to git root if possible, fall back to the given path.
+  local rroot
+  rroot="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" || rroot="$path"
+
+  if [[ ! -f "$REGISTRY" ]] || ! grep -qxF "$rroot" "$REGISTRY"; then
+    warn "'$rroot' is not in the registry"
+    return 1
+  fi
+
+  local tmp; tmp="$(mktemp)"
+  grep -vxF "$rroot" "$REGISTRY" > "$tmp" && mv "$tmp" "$REGISTRY"
+  ok "unregistered $rroot"
+}
+
+cmd_repos() {
+  local svc_state="stopped"
+  service_running && svc_state="${c_grn}running${c_reset}"
+  echo "${c_bold}Global service:${c_reset} $(service_name) — $svc_state"
+  echo
+  if [[ ! -f "$REGISTRY" ]] || [[ ! -s "$REGISTRY" ]]; then
+    info "No repos registered. Run: auto-issue register"
+    return 0
+  fi
+  echo "${c_bold}Registered repos:${c_reset}"
+  while IFS= read -r rpath; do
+    [[ -n "$rpath" ]] || continue
+    if [[ -d "$rpath" ]]; then
+      printf '  %s\n' "$rpath"
+    else
+      printf '  %s %s\n' "$rpath" "${c_ylw}(directory not found)${c_reset}"
+    fi
+  done < "$REGISTRY"
+}
+
+# ---------------------------------------------------------------------------
+# systemd user service management (single global service).
+# ---------------------------------------------------------------------------
+service_name()    { echo "auto-issue"; }
+service_unit()    { echo "$HOME/.config/systemd/user/auto-issue.service"; }
 service_running() { systemctl --user is-active --quiet "$(service_name).service" 2>/dev/null; }
 
 # systemd user services start with a minimal PATH (no ~/.local/bin, no nvm),
@@ -552,12 +674,11 @@ write_unit() {
   mkdir -p "$(dirname "$unit")"
   cat >"$unit" <<EOF
 [Unit]
-Description=auto-issue bot for $REPO ($REPO_ROOT)
+Description=auto-issue global bot
 After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$REPO_ROOT
 ExecStart=$SCRIPT_PATH loop
 Restart=always
 RestartSec=15
@@ -570,18 +691,18 @@ EOF
 }
 
 cmd_start_service() {
-  require_repo
-  ensure_state_dir
+  setup_gh_auth
+  ensure_global_dir
+  [[ -s "$REGISTRY" ]] || die "No repos registered. Run: auto-issue register <path>"
   local name; name="$(service_name)"
   if service_running; then
-    info "replacing the running service '$name' (config refresh)"
+    info "replacing running service '$name' (config refresh)"
     systemctl --user stop "$name.service" >/dev/null 2>&1
   fi
   write_unit
   systemctl --user daemon-reload
   systemctl --user enable "$name.service" >/dev/null 2>&1
   systemctl --user restart "$name.service"
-  # Boot autostart needs lingering; try, but don't fail if it's not permitted.
   if [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]]; then
     loginctl enable-linger "$USER" >/dev/null 2>&1 \
       && info "enabled linger (service will start on boot)" \
@@ -591,13 +712,11 @@ cmd_start_service() {
 }
 
 cmd_stop_service() {
-  require_repo
   local name; name="$(service_name)"
   systemctl --user stop "$name.service" >/dev/null 2>&1 && ok "stopped $name" || warn "$name was not running"
 }
 
 cmd_disable_service() {
-  require_repo
   local name unit; name="$(service_name)"; unit="$(service_unit)"
   systemctl --user stop "$name.service" >/dev/null 2>&1
   systemctl --user disable "$name.service" >/dev/null 2>&1
@@ -607,42 +726,32 @@ cmd_disable_service() {
 }
 
 cmd_status_service() {
-  require_repo
   systemctl --user status "$(service_name).service" --no-pager 2>&1 | head -20 || true
 }
 
 cmd_logs() {
-  require_repo
   journalctl --user -u "$(service_name).service" -f --no-hostname
 }
 
-# List every auto-issue service on this machine (any repo), with its state and
-# working directory. Does not require being inside a repo.
+# Show the global service state and all registered repos.
 cmd_list_services() {
-  local units
-  units="$(systemctl --user list-unit-files 'auto-issue-*.service' --no-legend 2>/dev/null | awk '{print $1}')"
-  if [[ -z "$units" ]]; then
-    info "No auto-issue services installed on this machine."
-    return 0
-  fi
-  printf '%-26s %-10s %s\n' "SERVICE" "STATE" "DIRECTORY"
-  local u state dir color
-  while read -r u; do
-    [[ -n "$u" ]] || continue
-    state="$(systemctl --user is-active "$u" 2>/dev/null)"
-    dir="$(systemctl --user show "$u" -p WorkingDirectory --value 2>/dev/null)"
-    case "$state" in
-      active)   color="$c_grn" ;;
-      failed)   color="$c_red" ;;
-      *)        color="$c_dim" ;;
-    esac
-    printf '%-26s %s%-10s%s %s\n' "${u%.service}" "$color" "$state" "$c_reset" "$dir"
-  done <<<"$units"
+  local name; name="$(service_name)"
+  local state; state="$(systemctl --user is-active "$name.service" 2>/dev/null)"
+  local color
+  case "$state" in
+    active)  color="$c_grn" ;;
+    failed)  color="$c_red" ;;
+    *)       color="$c_dim" ;;
+  esac
+  printf '%s%-10s%s  (%s)\n' "$color" "$state" "$c_reset" "$name"
+  echo
+  cmd_repos
 }
 
 # ---------------------------------------------------------------------------
 # setup: guided one-time setup so `auto-issue` works from any GitHub folder.
 #   1. check dependencies   2. token + env file   3. install the command
+#   4. register a repo
 # ---------------------------------------------------------------------------
 
 # Prompt yes/no with a default; auto-answers the default if not interactive.
@@ -745,7 +854,19 @@ cmd_setup() {
   setup_check_deps
   setup_token
   setup_install_command
-  ok "Setup complete. cd into a GitHub repo and run: ${c_bold}auto-issue${c_reset}"
+  ensure_global_dir
+
+  echo "${c_bold}4. Register a repo${c_reset}"
+  setup_gh_auth
+  if detect_repo; then
+    if prompt_yn "Register the current repo ($REPO) now?" y; then
+      cmd_register "$PWD"
+    fi
+  else
+    info "Not in a GitHub repo — run '${c_bold}auto-issue register${c_reset}' inside a repo to register it"
+  fi
+  echo
+  ok "Setup complete. Run: ${c_bold}auto-issue repos${c_reset} to see registered repos"
 }
 
 # ---------------------------------------------------------------------------
@@ -753,27 +874,46 @@ cmd_setup() {
 # ---------------------------------------------------------------------------
 cmd_info() {
   setup_gh_auth
-  if ! detect_repo; then
-    err "Not a GitHub repository here."
-    return 1
+  echo "${c_bold}auto-issue configuration${c_reset}"
+  echo "  env file        $([[ -f "$ENV_FILE" ]] && echo "$ENV_FILE" || echo "${c_ylw}missing${c_reset}")"
+  echo "  global dir      $GLOBAL_DIR"
+  echo "  registry        $REGISTRY"
+  echo "  dry run         $DRY_RUN"
+  echo "  interval        ${INTERVAL}m,  max ${MAX_PER_CYCLE}/cycle,  cooldown ${COOLDOWN}s"
+  echo "  model           $MODEL_DEFAULT  (label '$MODEL_OPUS_LABEL' ⇒ $MODEL_OPUS)"
+  echo "  merge method    $MERGE_METHOD,  branch prefix '$WORK_BRANCH_PREFIX'"
+
+  local svc="not installed"
+  service_running && svc="${c_grn}running${c_reset}" \
+    || { [[ -f "$(service_unit)" ]] && svc="installed (stopped)"; }
+  echo "  service         $svc  ($(service_name))"
+  echo
+
+  if [[ -f "$REGISTRY" ]] && [[ -s "$REGISTRY" ]]; then
+    echo "${c_bold}Registered repos:${c_reset}"
+    while IFS= read -r rpath; do
+      [[ -n "$rpath" ]] || continue
+      if [[ -d "$rpath" ]]; then
+        printf '  %s\n' "$rpath"
+      else
+        printf '  %s %s\n' "$rpath" "${c_ylw}(missing)${c_reset}"
+      fi
+    done < "$REGISTRY"
+  else
+    info "No repos registered. Run: auto-issue register"
   fi
-  local writeable="no"; token_can_write && writeable="yes"
-  local svc="not installed"; service_running && svc="running" || { [[ -f "$(service_unit)" ]] && svc="installed (stopped)"; }
-  cat <<EOF
-${c_bold}auto-issue configuration${c_reset}
-  repo            ${c_cyn}$REPO${c_reset}
-  repo root       $REPO_ROOT
-  target branch   $TARGET_BRANCH  (default: $DEFAULT_BRANCH)
-  trigger label   ${BOT_LABEL:-<all open issues>}
-  state labels    $LABEL_PLAN → $LABEL_APPROVED / $LABEL_HALTED → $LABEL_DONE
-  model           $MODEL_DEFAULT  (label '$MODEL_OPUS_LABEL' ⇒ $MODEL_OPUS)
-  interval        ${INTERVAL}m,  max ${MAX_PER_CYCLE}/cycle,  cooldown ${COOLDOWN}s
-  merge method    $MERGE_METHOD,  branch prefix '$WORK_BRANCH_PREFIX'
-  token write?    $([[ "$writeable" == yes ]] && echo "${c_grn}yes${c_reset}" || echo "${c_red}no — fix AUTO_ISSUE_GH_TOKEN${c_reset}")
-  env file        $([[ -f "$ENV_FILE" ]] && echo "$ENV_FILE" || echo "${c_ylw}missing${c_reset}")
-  dry run         $DRY_RUN
-  service         $svc  ($(service_name))
-EOF
+  echo
+
+  # If we happen to be in a repo, show per-repo details too.
+  if detect_repo; then
+    local writeable="no"; token_can_write && writeable="yes"
+    echo "${c_bold}Current repo:${c_reset} $REPO"
+    echo "  repo root       $REPO_ROOT"
+    echo "  target branch   $TARGET_BRANCH  (default: $DEFAULT_BRANCH)"
+    echo "  trigger label   ${BOT_LABEL:-<all open issues>}"
+    echo "  state labels    $LABEL_PLAN → $LABEL_APPROVED / $LABEL_HALTED → $LABEL_DONE"
+    echo "  token write?    $([[ "$writeable" == yes ]] && echo "${c_grn}yes${c_reset}" || echo "${c_red}no — fix AUTO_ISSUE_GH_TOKEN${c_reset}")"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -781,21 +921,33 @@ EOF
 # ---------------------------------------------------------------------------
 cmd_interactive() {
   setup_gh_auth
-  if ! detect_repo; then
-    die "This folder isn't a GitHub repository. cd into one and try again."
-  fi
   echo
   cmd_info
   echo
 
-  if ! token_can_write; then
-    die "The active GitHub token cannot write to $REPO. Set AUTO_ISSUE_GH_TOKEN in $ENV_FILE and retry."
+  # If no repos registered yet, offer to register the current one.
+  if [[ ! -s "$REGISTRY" ]]; then
+    if detect_repo; then
+      if prompt_yn "Register $REPO for auto-issue now?" y; then
+        cmd_register "$PWD"
+      else
+        info "Run 'auto-issue register' inside any GitHub repo to get started"
+        exit 0
+      fi
+    else
+      die "No repos registered and not in a GitHub repo. cd into a repo and run: auto-issue register"
+    fi
+  else
+    # We have registered repos; offer to also register current repo if not already in.
+    if detect_repo && ! grep -qxF "$REPO_ROOT" "$REGISTRY" 2>/dev/null; then
+      if prompt_yn "Register current repo ($REPO) too?" n; then
+        cmd_register "$PWD"
+      fi
+    fi
   fi
 
   local running_note=""
-  if service_running; then
-    running_note=" ${c_ylw}(a background service is already running for this repo)${c_reset}"
-  fi
+  service_running && running_note=" ${c_ylw}(background service already running)${c_reset}"
 
   echo "${c_bold}How do you want to run it?${c_reset}$running_note"
   echo "  ${c_grn}1${c_reset}) Foreground   ${c_dim}— runs here, Ctrl-C to stop. ${c_bold}Recommended for the first try.${c_reset}"
@@ -819,24 +971,29 @@ usage() {
 ${c_bold}auto-issue${c_reset} — drive Claude Code tasks from GitHub issues
 
 USAGE
-  auto-issue                 Interactive launcher (info + choose foreground/background)
-  auto-issue info            Show resolved configuration (read-only)
-  auto-issue once            Run a single poll cycle and exit (great for testing)
-  auto-issue loop            Run the polling loop in the foreground
-  auto-issue labels          Create/refresh the workflow labels in this repo
+  auto-issue                    Interactive launcher (info + choose foreground/background)
+  auto-issue info               Show global configuration and registered repos
+  auto-issue once               Run a single poll cycle across all registered repos
+  auto-issue loop               Run the polling loop in the foreground
+  auto-issue labels             Create/refresh workflow labels in the current repo
 
-  auto-issue start           Start (or replace) the background service for this repo
-  auto-issue stop            Stop the background service
-  auto-issue status          Show this repo's background service status
-  auto-issue list            List ALL auto-issue services on this machine (any repo)
-  auto-issue logs            Follow background service logs
-  auto-issue disable         Stop and remove the background service
+  auto-issue register [path]    Register a repo (default: current directory)
+  auto-issue unregister [path]  Unregister a repo
+  auto-issue repos              List registered repos and service state
 
-  auto-issue setup           Install the 'auto-issue' command into ~/.local/bin
+  auto-issue start              Start (or replace) the global background service
+  auto-issue stop               Stop the global background service
+  auto-issue status             Show global service status
+  auto-issue list               Show service state and registered repos
+  auto-issue logs               Follow global service logs
+  auto-issue disable            Stop and remove the global background service
+
+  auto-issue setup              One-time setup (dependencies, token, install, register)
 
 TESTING
-  DRY_RUN=1 auto-issue once  Show what it would do without spawning Claude or mutating.
+  DRY_RUN=1 auto-issue once     Show what it would do without spawning Claude or mutating.
 
+State is stored in ~/.auto-issue/  (not inside any individual repo).
 See README.md for configuration and the full workflow.
 EOF
 }
@@ -847,20 +1004,23 @@ EOF
 main() {
   local cmd="${1:-}"
   case "$cmd" in
-    ""|run)        cmd_interactive ;;
-    info)          cmd_info ;;
-    once)          cmd_once ;;
-    loop)          cmd_loop ;;
-    labels)        require_repo; ensure_state_dir; ensure_labels ;;
-    start)         cmd_start_service ;;
-    stop)          cmd_stop_service ;;
-    status)        cmd_status_service ;;
-    list|ls|ps)    cmd_list_services ;;
-    logs)          cmd_logs ;;
-    disable|destroy) cmd_disable_service ;;
-    setup)         cmd_setup ;;
-    -h|--help|help) usage ;;
-    *)             err "unknown command: $cmd"; echo; usage; exit 1 ;;
+    ""|run)           cmd_interactive ;;
+    info)             cmd_info ;;
+    once)             cmd_once ;;
+    loop)             cmd_loop ;;
+    labels)           setup_gh_auth; detect_repo || die "Not a GitHub repository here."; ensure_global_dir; ensure_labels ;;
+    register)         cmd_register "${2:-}" ;;
+    unregister)       cmd_unregister "${2:-}" ;;
+    repos)            cmd_repos ;;
+    start)            cmd_start_service ;;
+    stop)             cmd_stop_service ;;
+    status)           cmd_status_service ;;
+    list|ls|ps)       cmd_list_services ;;
+    logs)             cmd_logs ;;
+    disable|destroy)  cmd_disable_service ;;
+    setup)            cmd_setup ;;
+    -h|--help|help)   usage ;;
+    *)                err "unknown command: $cmd"; echo; usage; exit 1 ;;
   esac
 }
 
