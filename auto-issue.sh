@@ -46,8 +46,10 @@ MODEL_OPUS="${MODEL_OPUS:-opus}"
 MODEL_OPUS_LABEL="${MODEL_OPUS_LABEL:-opus}"
 
 # Loop pacing.
-INTERVAL="${INTERVAL:-5}"          # minutes between polls
-MAX_PER_CYCLE="${MAX_PER_CYCLE:-10}" # max Claude actions per cycle
+INTERVAL_MIN="${INTERVAL_MIN:-1}"      # minutes — sleep after doing work (fast lane)
+INTERVAL_MAX="${INTERVAL_MAX:-20}"     # minutes — backoff ceiling when idle
+BACKOFF_FACTOR="${BACKOFF_FACTOR:-2}"  # multiply sleep by this each idle round
+MAX_PER_CYCLE="${MAX_PER_CYCLE:-10}"   # max Claude actions per cycle
 COOLDOWN="${COOLDOWN:-20}"         # seconds between Claude invocations
 CLAUDE_MAX_TURNS="${CLAUDE_MAX_TURNS:-40}"
 
@@ -498,7 +500,8 @@ run_cycle() {
     fi
   done
 
-  date '+%s' >"$STATE_DIR/last-check"
+  date -u '+%Y-%m-%dT%H:%M:%SZ' >"$STATE_DIR/last-check"
+  echo "$actions" >"$STATE_DIR/last-actions"
   info "cycle complete: $actions action(s) taken"
 }
 
@@ -523,6 +526,43 @@ run_cycle_for_repo() {
 }
 
 # ---------------------------------------------------------------------------
+# Quick activity probe — queries GitHub updated_at for each registered repo.
+# Returns 0 (activity found in ≥1 repo) or 1 (nothing new anywhere).
+# Fails open: returns 0 on missing last-check or API error.
+# ---------------------------------------------------------------------------
+quick_check_any_activity() {
+  local any=1  # start assuming no activity (exit 1)
+  while IFS= read -r rpath; do
+    [[ -n "$rpath" ]] || continue
+    [[ -d "$rpath" ]] || continue
+
+    local rroot
+    rroot="$(git -C "$rpath" rev-parse --show-toplevel 2>/dev/null)" || { any=0; break; }
+    local sdir; sdir="$(global_state_dir "$rroot")"
+
+    if [[ ! -f "$sdir/last-check" ]]; then
+      any=0; break  # no checkpoint → fail-open, run a full cycle
+    fi
+    local last_iso; last_iso="$(cat "$sdir/last-check")"
+    [[ -z "$last_iso" ]] && { any=0; break; }
+
+    local repo_name
+    repo_name="$(cd "$rroot" && gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null)" \
+      || { any=0; break; }
+
+    local result cnt
+    result="$(gh api "/repos/${repo_name}/issues?state=open&since=${last_iso}&per_page=1" 2>/dev/null)" \
+      || { any=0; break; }
+    cnt="$(jq 'length' <<<"$result" 2>/dev/null)" || { any=0; break; }
+
+    if [[ "${cnt:-0}" -gt 0 ]]; then
+      any=0; break  # activity in this repo
+    fi
+  done < "$REGISTRY"
+  return "$any"
+}
+
+# ---------------------------------------------------------------------------
 # Loop runner (foreground; also the systemd ExecStart target).
 # ---------------------------------------------------------------------------
 cmd_loop() {
@@ -530,23 +570,56 @@ cmd_loop() {
   ensure_global_dir
   [[ -s "$REGISTRY" ]] || die "No repos registered. Run: auto-issue register"
 
-  info "auto-issue global loop started — interval ${INTERVAL}m"
+  info "auto-issue global loop started — min ${INTERVAL_MIN}m / max ${INTERVAL_MAX}m / backoff ×${BACKOFF_FACTOR}"
   while IFS= read -r rpath; do
     [[ -n "$rpath" ]] && info "  registered: $rpath"
   done < "$REGISTRY"
 
+  local _total_file; _total_file="$GLOBAL_DIR/last-cycle-total"
+  local current_sleep=$(( INTERVAL_MIN * 60 ))
+  local interval_max_s=$(( INTERVAL_MAX * 60 ))
+
   trap 'echo; warn "stopping auto-issue loop"; exit 0' INT TERM
   while true; do
+    if ! quick_check_any_activity; then
+      local new_sleep=$(( current_sleep * BACKOFF_FACTOR ))
+      (( new_sleep > interval_max_s )) && new_sleep=$interval_max_s
+      current_sleep=$new_sleep
+      info "quick-check: no new activity — sleeping $(( current_sleep / 60 ))m"
+      sleep "$current_sleep"
+      continue
+    fi
+
+    echo 0 > "$_total_file"
     (
       flock -n 9 || { warn "another auto-issue runner holds the lock; skipping cycle"; exit 0; }
+      local _total=0
       while IFS= read -r rpath; do
         [[ -n "$rpath" ]] || continue
         [[ -d "$rpath" ]] || { warn "registered path missing: $rpath"; continue; }
         run_cycle_for_repo "$rpath"
+        local rroot; rroot="$(git -C "$rpath" rev-parse --show-toplevel 2>/dev/null)" || continue
+        local sdir; sdir="$(global_state_dir "$rroot")"
+        local cnt=0
+        [[ -f "$sdir/last-actions" ]] && cnt="$(cat "$sdir/last-actions")"
+        _total=$(( _total + cnt ))
       done < "$REGISTRY"
+      echo "$_total" > "$_total_file"
     ) 9>"$GLOBAL_DIR/lock"
-    info "sleeping ${INTERVAL}m"
-    sleep "$(( INTERVAL * 60 ))"
+
+    local cycle_actions=0
+    [[ -f "$_total_file" ]] && cycle_actions="$(cat "$_total_file")"
+
+    if (( cycle_actions > 0 )); then
+      current_sleep=$(( INTERVAL_MIN * 60 ))
+      info "cycle did work — resetting sleep to ${INTERVAL_MIN}m"
+    else
+      local new_sleep=$(( current_sleep * BACKOFF_FACTOR ))
+      (( new_sleep > interval_max_s )) && new_sleep=$interval_max_s
+      current_sleep=$new_sleep
+      info "cycle: no actionable issues — sleeping $(( current_sleep / 60 ))m"
+    fi
+    sleep "$current_sleep"
   done
 }
 
@@ -684,6 +757,9 @@ Restart=always
 RestartSec=15
 Environment=AUTO_ISSUE_ENV_FILE=$ENV_FILE
 Environment=PATH=$(service_path)
+Environment=INTERVAL_MIN=${INTERVAL_MIN}
+Environment=INTERVAL_MAX=${INTERVAL_MAX}
+Environment=BACKOFF_FACTOR=${BACKOFF_FACTOR}
 
 [Install]
 WantedBy=default.target
@@ -879,7 +955,7 @@ cmd_info() {
   echo "  global dir      $GLOBAL_DIR"
   echo "  registry        $REGISTRY"
   echo "  dry run         $DRY_RUN"
-  echo "  interval        ${INTERVAL}m,  max ${MAX_PER_CYCLE}/cycle,  cooldown ${COOLDOWN}s"
+  echo "  interval        min ${INTERVAL_MIN}m / max ${INTERVAL_MAX}m / backoff ×${BACKOFF_FACTOR},  max ${MAX_PER_CYCLE}/cycle,  cooldown ${COOLDOWN}s"
   echo "  model           $MODEL_DEFAULT  (label '$MODEL_OPUS_LABEL' ⇒ $MODEL_OPUS)"
   echo "  merge method    $MERGE_METHOD,  branch prefix '$WORK_BRANCH_PREFIX'"
 
