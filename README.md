@@ -1,30 +1,38 @@
 # scripts
 
-A grab-bag of standalone scripts I reach for now and then. No structure yet — folders will appear once there's enough to group.
+A grab-bag of standalone scripts I reach for now and then.
 
 ## Contents
 
 ### [`scan-for-package.sh`](./scan-for-package.sh)
 
-Hunts the filesystem for evidence of a specific npm or pip package — installed dirs, manifests, lockfiles, global/site-packages. Built for chasing compromised or typosquatted dependencies: e.g. when a malicious npm package shows up in the news and you want to know whether anything on the machine is pulling it in.
+Hunts the filesystem for evidence of one or more npm / pip packages — installed dirs, manifests, lockfiles, global / site-packages. Built for chasing compromised or typosquatted dependencies: paste in an advisory and it tells you exactly which machines (and which versions) are affected.
 
-Each hit is annotated with the **actual version(s)** found, since takeovers are usually scoped to a specific release window. After the scan, if anything turned up, an interactive prompt lets you narrow the result by version — useful when a popular package (`lodash`, `chalk`, …) appears dozens of times but only the releases in the advisory window are problematic.
+**v2 highlights over the old version:**
 
-Supported filter expressions:
-
-- exact: `1.2.3`, `v1.2.3`, `=1.2.3`
-- range: `1.2.3 - 1.5.0` (inclusive, spaces required around the hyphen)
-- operators: `>1.2.3`, `>=1.2.3`, `<1.2.3`, `<=1.2.3`
-- caret / tilde: `^1.2.3` (next major), `~1.2.3` (next minor)
-- multiple (OR): comma-separated — e.g. `4.17.15, >=5.0.0`
+- **Multi-package** — scan for several packages in one filesystem walk.
+- **Advisory paste mode** — paste a raw security advisory and the parser extracts the package names and version ranges automatically.
+- **Per-hit verdicts** — every hit is classified as `VULN`, `OK`, `UNKNOWN`, or `INFO` (discovery), not just flagged as "found".
+- **AND-range support** — advisories like `>=8.0.0 <=8.0.1` (space-separated = AND) are parsed correctly alongside OR-alternatives.
+- **All three spec syntaxes** accepted — advisory-style (`name: <=7.5.5 and >=8.0.0 <=8.0.1`), npm semver (`pkg@<7.5.6 || >=8.0.0 <8.0.2`), and pip/PEP 440 (`pkg>=4.21.0,!=4.24.1,<5.0`).
+- **Registry fix-version lookup** — after a VULN hit, queries npm / PyPI for the first safe release so you know what to upgrade to.
+- **Export** — `--export-dir` writes a findings report and a best-effort update script without any interactive prompts.
+- **False-positive reduction** — structurally-anchored manifest matching avoids mis-hits on repo URLs, maintainer emails, and scoped helper packages.
 
 Usage:
 
 ```
-./scan-for-package.sh [-m npm|python|both] PACKAGE_NAME [SEARCH_ROOT]
+./scan-for-package.sh [options] 'NAME[:VERSION_EXPR]' [...] [SEARCH_ROOT]
+./scan-for-package.sh --paste          # paste advisory lines interactively
+printf '...\n' | ./scan-for-package.sh --paste   # pipe advisory from stdin
+./scan-for-package.sh                  # interactive prompts
 ```
 
-Run with no args for interactive prompts. Exits `0` for no evidence, `3` if anything was found. Hits whose version couldn't be extracted are still shown during the scan but excluded from filtered output.
+Common options: `-m npm|python|both`, `-r ROOT`, `-y` (skip confirmation), `--no-registry`, `--export-dir DIR`.
+
+Exit codes: `0` = nothing found or everything OK · `3` = VULN or INFO hits present · `4` = no VULN but UNKNOWN hits need manual review.
+
+Optional tools (scan degrades gracefully without them): `python3` / `jq` for precise JSON parsing, `npm` for `npm ls` + global-root discovery, `curl` for the registry fix-version lookup.
 
 ### [`auto-issue.sh`](./auto-issue.sh)
 
@@ -134,3 +142,11 @@ Set in `~/.auto-issue.env` or the environment. Defaults in **bold**.
 | `DRY_RUN` | **`0`** | `1` = simulate, never spawn Claude or mutate. |
 
 The bot uses an **adaptive polling interval**: it first issues a cheap GitHub API probe (`since=<last-check>`) to see if any issues changed. If nothing changed it backs off exponentially (up to `INTERVAL_MAX` minutes); as soon as work is detected or done the sleep resets to `INTERVAL_MIN`. State (last-check timestamp, per-repo action counts) lives in `~/.auto-issue/state/`. Claude runs unattended with `--permission-mode bypassPermissions`; only point it at repos you trust it to modify.
+
+## Archive
+
+Older scripts kept for reference. Not actively maintained.
+
+| Script | Notes |
+|---|---|
+| [`archive/scan-for-package_v1.sh`](./archive/scan-for-package_v1.sh) | Original single-package scanner (v1.0.0). Superseded by the v2 rewrite above. |
