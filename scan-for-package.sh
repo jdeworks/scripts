@@ -1521,24 +1521,58 @@ py_manifest_check() {
 # fresh install would fetch TODAY, which may differ from the installed state
 # (the installed state is covered by the site-packages / pip-show scans).
 
+RESOLVE_CLEANED=0        # last resolve_requirements call needed junk-stripping
+
 resolve_requirements() { # src dst -> 0 on success (dst holds pinned tree;
                          # on failure dst.err holds the resolver's stderr)
     local src="$1" dst="$2"
-    local dir="${src%/*}" base="${src##*/}"
+    local dir="${src%/*}" base="${src##*/}" stdin_mode=0
     [[ "$dir" == "$src" ]] && dir="."
-    # run inside the file's dir so '-r other.txt' / '-c ...' includes resolve
+    RESOLVE_CLEANED=0
+    : > "$dst.err"
+    # Invisible junk - UTF-8 BOMs (also mid-file), zero-width spaces, CRLF -
+    # breaks both resolvers' parsers ("Unexpected '<BOM>', expected ... start
+    # of a requirement"); Windows- or LLM-authored files often carry these.
+    # Detect it UP FRONT and work from a cleaned copy fed via stdin: the
+    # original file is NEVER modified, and cwd stays at the file's directory
+    # so relative '-r'/'-c' includes still resolve. Cleaning first (rather
+    # than as a retry) also means a failure's reported reason is the real
+    # post-clean error, not the parse noise.
+    if LC_ALL=C grep -qE $'\xef\xbb\xbf|\xe2\x80\x8b|\r' -- "$src" 2>/dev/null; then
+        LC_ALL=C sed -e 's/\xef\xbb\xbf//g; s/\xe2\x80\x8b//g; s/\r$//' -- "$src" > "$dst.clean" 2>/dev/null
+        RESOLVE_CLEANED=1
+        stdin_mode=1
+    fi
     if (( HAVE_UV )); then
-        if ( cd "$dir" 2>/dev/null && \
-             timeout 90 uv pip compile -q --no-header --no-annotate "$base" \
-           ) > "$dst" 2>"$dst.err" && [[ -s "$dst" ]]; then
-            return 0
+        if (( stdin_mode )); then
+            ( cd "$dir" 2>/dev/null && \
+              timeout 90 uv pip compile -q --no-header --no-annotate - < "$dst.clean" \
+            ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]] && return 0
+        else
+            ( cd "$dir" 2>/dev/null && \
+              timeout 90 uv pip compile -q --no-header --no-annotate "$base" \
+            ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]] && return 0
+        fi
+        # "No solution found" is a definitive resolver answer, not a tool
+        # failure - pip-compile would only grind (often building sdists for
+        # minutes) to reach the same conclusion. Fail fast with the reason.
+        if LC_ALL=C grep -q 'No solution found' -- "$dst.err" 2>/dev/null; then
+            return 1
         fi
     fi
     if (( HAVE_PIPCOMPILE )); then
-        if ( cd "$dir" 2>/dev/null && \
-             timeout 300 pip-compile -q --no-header --no-annotate -o - "$base" \
-           ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]]; then
-            return 0
+        # --prefer-binary: metadata from wheels instead of building sdists
+        # (source builds can take minutes per package)
+        if (( stdin_mode )); then
+            ( cd "$dir" 2>/dev/null && \
+              timeout 300 pip-compile -q --no-header --no-annotate \
+                  --pip-args --prefer-binary -o - - < "$dst.clean" \
+            ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]] && return 0
+        else
+            ( cd "$dir" 2>/dev/null && \
+              timeout 300 pip-compile -q --no-header --no-annotate \
+                  --pip-args --prefer-binary -o - "$base" \
+            ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]] && return 0
         fi
     fi
     return 1
@@ -1644,8 +1678,10 @@ resolve_and_scan_requirements() {
             spinner_stop
             REQ_RESOLVED=$(( REQ_RESOLVED + 1 ))
             npinned="$(grep -cE '==' -- "$out" 2>/dev/null)"
-            printf '  %s[%d/%d] %s: %s top-level dep(s) -> %s package(s) in the full tree%s\n' \
-                "$DIM" "$i" "$total" "$f" "$ndeps" "${npinned:-?}" "$RESET"
+            local cleannote=""
+            (( RESOLVE_CLEANED )) && cleannote=" (auto-cleaned invisible BOM/CRLF chars first)"
+            printf '  %s[%d/%d] %s: %s top-level dep(s) -> %s package(s) in the full tree%s%s\n' \
+                "$DIM" "$i" "$total" "$f" "$ndeps" "${npinned:-?}" "$cleannote" "$RESET"
             scan_resolved_file "$f" "$out"
         else
             spinner_stop
