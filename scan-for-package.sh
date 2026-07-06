@@ -7,11 +7,13 @@
 # v2.1.0 - requirements.txt transitive resolution via uv pip compile /
 #          pip-compile (top-level-only files hide vulnerable transitive
 #          deps), interactive ecosystem choice, --no-pip-compile.
+# v2.2.0 - best-effort per-requirements-file Python version selection for
+#          uv resolution via --resolve-python auto|ambient|X.Y.
 set -uEo pipefail
 IFS=$'\n\t'
 shopt -s nullglob
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 SCAN_PWD="$(pwd)"
 
 ############################
@@ -208,6 +210,9 @@ Options:
                                (also disables requirements resolution: network)
       --no-pip-compile         do not resolve requirements files with
                                uv/pip-compile (transitive deps stay unchecked)
+      --resolve-python auto|ambient|X.Y
+                               Python version for requirements resolution
+                               (default: auto; auto reads nearby project files)
       --export-dir DIR         write findings + update script there (no prompt)
   -h, --help                   this help
       --version                print version
@@ -238,6 +243,10 @@ Optional tools (the scan runs without them, just with less precision):
                  uv preferred (much faster), pip-compile as fallback; files
                  that fail to resolve are flagged. Missing both -> top-level
                  scan only, with a recommendation to install one of them.
+                 With uv, --resolve-python auto picks a best-effort Python
+                 version per requirements file from nearby .python-version,
+                 runtime.txt, Dockerfile, pyproject/Pipfile/setup/tox/CI files;
+                 use ambient to preserve uv's global default, or X.Y to force.
                  Hits found ONLY in the resolved tree are marked "resolved
                  transitive": a fresh install WOULD pull that version - it
                  says nothing about what is currently installed.
@@ -269,6 +278,7 @@ FORCE_PASTE=0
 MATCH_OVERRIDE=""      # "", exact, contains
 NO_REGISTRY=0;   REGISTRY_SET=0
 NO_PIPCOMPILE=0; PIPCOMPILE_SET=0
+RESOLVE_PYTHON="auto"
 EXPORT_DIR=""
 RAW_SPECS=()
 
@@ -282,6 +292,7 @@ while [[ $# -gt 0 ]]; do
         --exact)          MATCH_OVERRIDE="exact"; shift ;;
         --no-registry)    NO_REGISTRY=1; REGISTRY_SET=1; shift ;;
         --no-pip-compile) NO_PIPCOMPILE=1; PIPCOMPILE_SET=1; shift ;;
+        --resolve-python) RESOLVE_PYTHON="${2:-auto}"; shift 2 ;;
         --export-dir)     EXPORT_DIR="${2:-}"; shift 2 ;;
         -h|--help)        usage; exit 0 ;;
         --version)        echo "scan-for-package.sh $VERSION"; exit 0 ;;
@@ -292,6 +303,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MODE" in npm|python|py|both|all) : ;; *) err "invalid mode: $MODE"; exit 1 ;; esac
+case "$RESOLVE_PYTHON" in
+    auto|ambient|[0-9]*.[0-9]*) : ;;
+    *) err "invalid --resolve-python: $RESOLVE_PYTHON (use auto, ambient, or MAJOR.MINOR)"; exit 1 ;;
+esac
 [[ "$MODE" == "py"  ]] && MODE=python
 [[ "$MODE" == "all" ]] && MODE=both
 
@@ -1522,14 +1537,155 @@ py_manifest_check() {
 # (the installed state is covered by the site-packages / pip-show scans).
 
 RESOLVE_CLEANED=0        # last resolve_requirements call needed junk-stripping
+RESOLVE_PY_NOTE=""       # human note for the last resolver invocation
+
+py_minor_from_text() { # text -> first MAJOR.MINOR-looking Python version
+    local s="$1"
+    if [[ "$s" =~ ([Pp]ython[-[:space:]]*)?([23])\.([0-9]+) ]]; then
+        printf '%s.%s' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+        return 0
+    fi
+    return 1
+}
+
+py_next_minor() { # MAJOR.MINOR -> next MAJOR.MINOR
+    local v="$1" major minor
+    major="${v%%.*}"
+    minor="${v#*.}"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+    printf '%s.%s' "$major" "$(( minor + 1 ))"
+}
+
+py_version_from_spec() { # requires-python-ish text -> best lower-bound MAJOR.MINOR
+    local spec="$1" v
+    spec="${spec%%#*}"
+    spec="${spec//\"/}"
+    spec="${spec//\'/}"
+    spec="$(trim "$spec")"
+    [[ -z "$spec" ]] && return 1
+    if [[ "$spec" =~ \>[[:space:]]*=?[[:space:]]*([23]\.[0-9]+(\.[0-9]+)?) ]]; then
+        v="${BASH_REMATCH[1]}"
+        if [[ "$spec" =~ \>[[:space:]]*[^=] && "$v" =~ ^[23]\.[0-9]+$ ]]; then
+            py_next_minor "$v"
+        else
+            py_minor_from_text "$v"
+        fi
+        return $?
+    fi
+    if [[ "$spec" =~ (~=|\^|==|=)[[:space:]]*([23]\.[0-9]+(\.[0-9]+|\.\*)?) ]]; then
+        py_minor_from_text "${BASH_REMATCH[2]}"
+        return $?
+    fi
+    py_minor_from_text "$spec"
+}
+
+resolve_python_from_exact_files() { # dir -> "ver<TAB>source"
+    local dir="$1" line ver
+    if [[ -f "$dir/.python-version" ]]; then
+        line="$(grep -Eim1 '[23]\.[0-9]+' -- "$dir/.python-version" 2>/dev/null || true)"
+        if ver="$(py_minor_from_text "$line")"; then printf '%s\t.python-version\n' "$ver"; return 0; fi
+    fi
+    if [[ -f "$dir/runtime.txt" ]]; then
+        line="$(grep -Eim1 '[Pp]ython-?[23]\.[0-9]+|[23]\.[0-9]+' -- "$dir/runtime.txt" 2>/dev/null || true)"
+        if ver="$(py_minor_from_text "$line")"; then printf '%s\truntime.txt\n' "$ver"; return 0; fi
+    fi
+    return 1
+}
+
+resolve_python_from_docker() { # dir -> "ver<TAB>source"
+    local dir="$1" f line ver
+    if [[ -f "$dir/Dockerfile" ]]; then
+        f="$dir/Dockerfile"
+    else
+        f="$(find "$dir" -maxdepth 1 -type f -name 'Dockerfile.*' 2>/dev/null | sort | head -1)"
+    fi
+    [[ -n "$f" ]] || return 1
+    line="$(grep -Ei '^[[:space:]]*FROM[[:space:]]+([^[:space:]]*/)?python:[^[:space:]]+' -- "$f" 2>/dev/null | tail -1 || true)"
+    if ver="$(py_minor_from_text "$line")"; then
+        printf '%s\t%s\n' "$ver" "${f##*/}"
+        return 0
+    fi
+    return 1
+}
+
+resolve_python_from_project_meta() { # dir -> "ver<TAB>source"
+    local dir="$1" ver line
+    if [[ -f "$dir/pyproject.toml" ]]; then
+        line="$(grep -Eim1 '^[[:space:]]*requires-python[[:space:]]*=' -- "$dir/pyproject.toml" 2>/dev/null || true)"
+        if ver="$(py_version_from_spec "$line")"; then printf '%s\tpyproject.toml requires-python\n' "$ver"; return 0; fi
+        line="$(grep -Eim1 '^[[:space:]]*python[[:space:]]*=' -- "$dir/pyproject.toml" 2>/dev/null || true)"
+        if ver="$(py_version_from_spec "$line")"; then printf '%s\tpyproject.toml python\n' "$ver"; return 0; fi
+    fi
+    if [[ -f "$dir/Pipfile" ]]; then
+        line="$(grep -Eim1 '^[[:space:]]*python_(full_)?version[[:space:]]*=' -- "$dir/Pipfile" 2>/dev/null || true)"
+        if ver="$(py_version_from_spec "$line")"; then printf '%s\tPipfile\n' "$ver"; return 0; fi
+    fi
+    if [[ -f "$dir/setup.cfg" ]]; then
+        line="$(grep -Eim1 '^[[:space:]]*python_requires[[:space:]]*=' -- "$dir/setup.cfg" 2>/dev/null || true)"
+        if ver="$(py_version_from_spec "$line")"; then printf '%s\tsetup.cfg python_requires\n' "$ver"; return 0; fi
+    fi
+    if [[ -f "$dir/setup.py" ]]; then
+        line="$(grep -Eim1 'python_requires[[:space:]]*=' -- "$dir/setup.py" 2>/dev/null || true)"
+        if ver="$(py_version_from_spec "$line")"; then printf '%s\tsetup.py python_requires\n' "$ver"; return 0; fi
+    fi
+    return 1
+}
+
+resolve_python_from_ci_meta() { # dir -> "ver<TAB>source"
+    local dir="$1" line ver f
+    if [[ -f "$dir/tox.ini" ]]; then
+        line="$(grep -Eim1 'basepython[[:space:]]*=|envlist[[:space:]]*=.*py[0-9]{2,3}' -- "$dir/tox.ini" 2>/dev/null || true)"
+        if [[ "$line" =~ py([23])([0-9]{1,2}) ]]; then
+            printf '%s.%s\ttox.ini\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+            return 0
+        fi
+        if ver="$(py_minor_from_text "$line")"; then printf '%s\ttox.ini\n' "$ver"; return 0; fi
+    fi
+    if [[ -d "$dir/.github/workflows" ]]; then
+        f="$(find "$dir/.github/workflows" -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null | sort | head -1)"
+        if [[ -n "$f" ]]; then
+            line="$(grep -Eim1 'python-version|python[[:space:]]+[23]\.[0-9]+' -- "$f" 2>/dev/null || true)"
+            if ver="$(py_minor_from_text "$line")"; then printf '%s\t.github/workflows/%s\n' "$ver" "${f##*/}"; return 0; fi
+        fi
+    fi
+    return 1
+}
+
+resolve_python_choice() { # requirements file -> "ver<TAB>source", empty for ambient
+    local src="$1" dir root choice
+    case "$RESOLVE_PYTHON" in
+        ambient) return 1 ;;
+        [0-9]*.[0-9]*) printf '%s\t--resolve-python\n' "$RESOLVE_PYTHON"; return 0 ;;
+    esac
+    dir="${src%/*}"
+    [[ "$dir" == "$src" ]] && dir="."
+    dir="$(readlink -f "$dir" 2>/dev/null || printf '%s' "$dir")"
+    root="$(readlink -f "$SEARCH_ROOT" 2>/dev/null || printf '%s' "$SEARCH_ROOT")"
+    while [[ -n "$dir" && "$dir" == "$root"* ]]; do
+        choice="$(resolve_python_from_exact_files "$dir")" && { printf '%s' "$choice"; return 0; }
+        choice="$(resolve_python_from_docker "$dir")" && { printf '%s' "$choice"; return 0; }
+        choice="$(resolve_python_from_project_meta "$dir")" && { printf '%s' "$choice"; return 0; }
+        choice="$(resolve_python_from_ci_meta "$dir")" && { printf '%s' "$choice"; return 0; }
+        [[ "$dir" == "$root" || "$dir" == "/" ]] && break
+        dir="${dir%/*}"
+    done
+    return 1
+}
 
 resolve_requirements() { # src dst -> 0 on success (dst holds pinned tree;
                          # on failure dst.err holds the resolver's stderr)
     local src="$1" dst="$2"
     local dir="${src%/*}" base="${src##*/}" stdin_mode=0
+    local py_choice py_ver py_source
     [[ "$dir" == "$src" ]] && dir="."
     RESOLVE_CLEANED=0
+    RESOLVE_PY_NOTE="using ambient Python"
     : > "$dst.err"
+    if py_choice="$(resolve_python_choice "$src")"; then
+        py_ver="${py_choice%%$'\t'*}"
+        py_source="${py_choice#*$'\t'}"
+        RESOLVE_PY_NOTE="using Python ${py_ver} from ${py_source}"
+    fi
     # Invisible junk - UTF-8 BOMs (also mid-file), zero-width spaces, CRLF -
     # breaks both resolvers' parsers ("Unexpected '<BOM>', expected ... start
     # of a requirement"); Windows- or LLM-authored files often carry these.
@@ -1545,13 +1701,25 @@ resolve_requirements() { # src dst -> 0 on success (dst holds pinned tree;
     fi
     if (( HAVE_UV )); then
         if (( stdin_mode )); then
-            ( cd "$dir" 2>/dev/null && \
-              timeout 90 uv pip compile -q --no-header --no-annotate - < "$dst.clean" \
-            ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]] && return 0
+            if [[ -n "${py_ver:-}" ]]; then
+                ( cd "$dir" 2>/dev/null && \
+                  timeout 90 uv pip compile --python-version "$py_ver" -q --no-header --no-annotate - < "$dst.clean" \
+                ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]] && return 0
+            else
+                ( cd "$dir" 2>/dev/null && \
+                  timeout 90 uv pip compile -q --no-header --no-annotate - < "$dst.clean" \
+                ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]] && return 0
+            fi
         else
-            ( cd "$dir" 2>/dev/null && \
-              timeout 90 uv pip compile -q --no-header --no-annotate "$base" \
-            ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]] && return 0
+            if [[ -n "${py_ver:-}" ]]; then
+                ( cd "$dir" 2>/dev/null && \
+                  timeout 90 uv pip compile --python-version "$py_ver" -q --no-header --no-annotate "$base" \
+                ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]] && return 0
+            else
+                ( cd "$dir" 2>/dev/null && \
+                  timeout 90 uv pip compile -q --no-header --no-annotate "$base" \
+                ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]] && return 0
+            fi
         fi
         # "No solution found" is a definitive resolver answer, not a tool
         # failure - pip-compile would only grind (often building sdists for
@@ -1680,13 +1848,13 @@ resolve_and_scan_requirements() {
             npinned="$(grep -cE '==' -- "$out" 2>/dev/null)"
             local cleannote=""
             (( RESOLVE_CLEANED )) && cleannote=" (auto-cleaned invisible BOM/CRLF chars first)"
-            printf '  %s[%d/%d] %s: %s top-level dep(s) -> %s package(s) in the full tree%s%s\n' \
-                "$DIM" "$i" "$total" "$f" "$ndeps" "${npinned:-?}" "$cleannote" "$RESET"
+            printf '  %s[%d/%d] %s: %s top-level dep(s) -> %s package(s) in the full tree (%s)%s%s\n' \
+                "$DIM" "$i" "$total" "$f" "$ndeps" "${npinned:-?}" "$RESOLVE_PY_NOTE" "$cleannote" "$RESET"
             scan_resolved_file "$f" "$out"
         else
             spinner_stop
             REQ_RESOLVE_FAILED=$(( REQ_RESOLVE_FAILED + 1 ))
-            RESOLVE_FAILED_LIST+=("$f"$'\t'"$(resolve_fail_reason "$out.err")")
+            RESOLVE_FAILED_LIST+=("$f"$'\t'"${RESOLVE_PY_NOTE}; $(resolve_fail_reason "$out.err")")
         fi
     done
     clear_line

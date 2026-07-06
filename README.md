@@ -24,6 +24,10 @@ Hunts the filesystem for evidence of one or more npm / pip packages — installe
 - **Transitive python deps via resolution** — a plain `requirements.txt` only lists top-level packages, so vulnerable transitive deps are invisible in it. When `uv` (preferred, fast) or `pip-compile` is installed, each requirements file is resolved to its full pinned dependency tree and that tree is scanned too. Hits found only there are marked **`resolved transitive`**: a fresh `pip install -r` *would* pull that version (actually-installed state is covered by the site-packages / pip scans). Files that fail to resolve are flagged so nothing is silently skipped; already-`pip-compile`d lockfiles are detected and not re-resolved. If neither tool is installed, the scan warns up front and recommends installing one. Disable with `--no-pip-compile`; `--no-registry` (offline) also skips it.
 - **Guided setup** — running the script bare walks you through every setting interactively (ecosystems, search root, registry lookup, requirements resolution). Any flag you pass pins that setting and skips its prompt; `-y` or non-TTY runs take the defaults silently.
 
+**v2.2 additions:**
+
+- **Per-file Python version for uv resolution** — `--resolve-python auto` chooses a best-effort Python version per requirements file from nearby `.python-version`, `runtime.txt`, Dockerfile, pyproject/Pipfile/setup, tox, or CI metadata. Use `--resolve-python ambient` to keep uv's global default or `--resolve-python X.Y` to force a version.
+
 Usage:
 
 ```
@@ -33,7 +37,7 @@ printf '...\n' | ./scan-for-package.sh --paste   # pipe advisory from stdin
 ./scan-for-package.sh                  # interactive prompts
 ```
 
-Common options: `-m npm|python|both`, `-r ROOT`, `-y` (skip confirmation + guided setup), `--no-registry`, `--no-pip-compile`, `--export-dir DIR`.
+Common options: `-m npm|python|both`, `-r ROOT`, `-y` (skip confirmation + guided setup), `--no-registry`, `--no-pip-compile`, `--resolve-python auto|ambient|X.Y`, `--export-dir DIR`.
 
 Exit codes: `0` = nothing found or everything OK · `3` = VULN or INFO hits present · `4` = no VULN but UNKNOWN hits need manual review.
 
