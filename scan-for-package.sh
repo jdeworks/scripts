@@ -4,11 +4,14 @@
 #
 # v2.0.0 - multi-package, advisory paste mode, AND-ranges, per-hit
 #          verdicts (VULN/OK/UNKNOWN), npm/PyPI fix lookup, exports.
+# v2.1.0 - requirements.txt transitive resolution via uv pip compile /
+#          pip-compile (top-level-only files hide vulnerable transitive
+#          deps), interactive ecosystem choice, --no-pip-compile.
 set -uEo pipefail
 IFS=$'\n\t'
 shopt -s nullglob
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 SCAN_PWD="$(pwd)"
 
 ############################
@@ -18,6 +21,7 @@ SCAN_PWD="$(pwd)"
 FOUND_FILE="$(mktemp)"
 HITS_FILE="$(mktemp)"      # TSV: pkg_idx \t verdict \t category \t detail \t versions
 WALK_FILE="$(mktemp)"
+RESOLVE_TMP="$(mktemp -d)" # compiled requirements output (never written next to sources)
 SPINNER_PID=""
 SPINNER_T0=0
 
@@ -25,6 +29,11 @@ NM_SCANNED=0
 SP_SCANNED=0
 NPM_MAN_SCANNED=0
 PY_MAN_SCANNED=0
+REQ_RESOLVED=0
+REQ_RESOLVE_FAILED=0
+REQ_ALREADY_PINNED=0
+REQ_SKIPPED_CACHE=0
+RESOLVE_FAILED_LIST=()   # entries: "<file>\t<first error line>"
 
 echo 0 > "$FOUND_FILE"
 
@@ -35,6 +44,7 @@ cleanup() {
         SPINNER_PID=""
     fi
     rm -f "$FOUND_FILE" "$HITS_FILE" "$WALK_FILE"
+    rm -rf "$RESOLVE_TMP"
 }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
@@ -192,11 +202,20 @@ Options:
       --paste                  read advisory lines from stdin
       --contains               force substring matching for all names
       --exact                  force exact matching for all names
-  -y, --yes                    skip the pre-scan confirmation
+  -y, --yes                    skip the pre-scan confirmation (and the
+                               guided setup - defaults/flags are used)
       --no-registry            skip the npm/PyPI fixed-version lookup
+                               (also disables requirements resolution: network)
+      --no-pip-compile         do not resolve requirements files with
+                               uv/pip-compile (transitive deps stay unchecked)
       --export-dir DIR         write findings + update script there (no prompt)
   -h, --help                   this help
       --version                print version
+
+Guided setup:
+  Any setting NOT fixed by a flag is asked interactively at startup when run
+  on a terminal (ecosystems, root, registry lookup, requirements resolution).
+  Non-interactive runs (pipes, cron) and -y/--yes take the defaults silently.
 
 Verdicts per hit:
   VULN     extracted version matches the vulnerable expression
@@ -213,6 +232,15 @@ Optional tools (the scan runs without them, just with less precision):
   npm            'npm ls' on the current project + global-root discovery.
   pipx           detect pipx-managed apps.
   curl           online npm/PyPI fix-version lookup (--no-registry skips it).
+  uv/pip-compile resolve requirements*.txt/.in to the FULL pinned dependency
+                 tree, so vulnerable TRANSITIVE python deps become visible
+                 (a plain requirements.txt only lists top-level packages).
+                 uv preferred (much faster), pip-compile as fallback; files
+                 that fail to resolve are flagged. Missing both -> top-level
+                 scan only, with a recommendation to install one of them.
+                 Hits found ONLY in the resolved tree are marked "resolved
+                 transitive": a fresh install WOULD pull that version - it
+                 says nothing about what is currently installed.
   Anything missing is reported once on the confirmation screen, never fatal.
 
 Exit codes:
@@ -232,30 +260,34 @@ Version: $VERSION
 EOF
 }
 
-MODE="both"
-SEARCH_ROOT="/"
+# Every setting below is dual: fix it with a flag, or leave it open and get
+# asked interactively at startup (TTY only). *_SET tracks "fixed by flag".
+MODE="both";     MODE_SET=0
+SEARCH_ROOT="/"; ROOT_SET=0
 ASSUME_YES=0
 FORCE_PASTE=0
 MATCH_OVERRIDE=""      # "", exact, contains
-NO_REGISTRY=0
+NO_REGISTRY=0;   REGISTRY_SET=0
+NO_PIPCOMPILE=0; PIPCOMPILE_SET=0
 EXPORT_DIR=""
 RAW_SPECS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -m|--mode)     MODE="${2:-}"; shift 2 ;;
-        -r|--root)     SEARCH_ROOT="${2:-/}"; shift 2 ;;
-        -y|--yes)      ASSUME_YES=1; shift ;;
-        --paste)       FORCE_PASTE=1; shift ;;
-        --contains)    MATCH_OVERRIDE="contains"; shift ;;
-        --exact)       MATCH_OVERRIDE="exact"; shift ;;
-        --no-registry) NO_REGISTRY=1; shift ;;
-        --export-dir)  EXPORT_DIR="${2:-}"; shift 2 ;;
-        -h|--help)     usage; exit 0 ;;
-        --version)     echo "scan-for-package.sh $VERSION"; exit 0 ;;
-        --)            shift; while [[ $# -gt 0 ]]; do RAW_SPECS+=("$1"); shift; done ;;
-        -*)            err "unknown flag: $1"; usage; exit 2 ;;
-        *)             RAW_SPECS+=("$1"); shift ;;
+        -m|--mode)        MODE="${2:-}"; MODE_SET=1; shift 2 ;;
+        -r|--root)        SEARCH_ROOT="${2:-/}"; ROOT_SET=1; shift 2 ;;
+        -y|--yes)         ASSUME_YES=1; shift ;;
+        --paste)          FORCE_PASTE=1; shift ;;
+        --contains)       MATCH_OVERRIDE="contains"; shift ;;
+        --exact)          MATCH_OVERRIDE="exact"; shift ;;
+        --no-registry)    NO_REGISTRY=1; REGISTRY_SET=1; shift ;;
+        --no-pip-compile) NO_PIPCOMPILE=1; PIPCOMPILE_SET=1; shift ;;
+        --export-dir)     EXPORT_DIR="${2:-}"; shift 2 ;;
+        -h|--help)        usage; exit 0 ;;
+        --version)        echo "scan-for-package.sh $VERSION"; exit 0 ;;
+        --)               shift; while [[ $# -gt 0 ]]; do RAW_SPECS+=("$1"); shift; done ;;
+        -*)               err "unknown flag: $1"; usage; exit 2 ;;
+        *)                RAW_SPECS+=("$1"); shift ;;
     esac
 done
 
@@ -268,12 +300,10 @@ if (( ${#RAW_SPECS[@]} >= 2 )); then
     last="${RAW_SPECS[${#RAW_SPECS[@]}-1]}"
     if [[ "$last" != *:* && -d "$last" ]]; then
         SEARCH_ROOT="$last"
+        ROOT_SET=1
         unset 'RAW_SPECS[${#RAW_SPECS[@]}-1]'
     fi
 fi
-
-# absolute root -> hit paths (and the exported update script) work from anywhere
-SEARCH_ROOT="$(readlink -f "$SEARCH_ROOT" 2>/dev/null || printf '%s' "$SEARCH_ROOT")"
 
 ############################
 # capabilities (detected once)
@@ -286,13 +316,73 @@ SEARCH_ROOT="$(readlink -f "$SEARCH_ROOT" 2>/dev/null || printf '%s' "$SEARCH_RO
 #   npm          : `npm ls` in the current project + global root discovery.
 #   pipx         : detect pipx-managed apps.
 #   curl         : online npm/PyPI fix-version lookup.
+#   uv/pip-compile: resolve requirements files to the full pinned dependency
+#                  tree (a plain requirements.txt lists only top-level deps,
+#                  so vulnerable TRANSITIVE deps stay invisible without this).
+#                  uv is preferred (much faster); pip-compile is the fallback.
 # We probe each tool ONCE here instead of forking `command -v` per file.
 
-HAVE_PYTHON3=0; command -v python3 >/dev/null 2>&1 && HAVE_PYTHON3=1
-HAVE_JQ=0;      command -v jq      >/dev/null 2>&1 && HAVE_JQ=1
-HAVE_NPM=0;     command -v npm     >/dev/null 2>&1 && HAVE_NPM=1
-HAVE_PIPX=0;    command -v pipx    >/dev/null 2>&1 && HAVE_PIPX=1
-HAVE_CURL=0;    command -v curl    >/dev/null 2>&1 && HAVE_CURL=1
+HAVE_PYTHON3=0;    command -v python3     >/dev/null 2>&1 && HAVE_PYTHON3=1
+HAVE_JQ=0;         command -v jq          >/dev/null 2>&1 && HAVE_JQ=1
+HAVE_NPM=0;        command -v npm         >/dev/null 2>&1 && HAVE_NPM=1
+HAVE_PIPX=0;       command -v pipx        >/dev/null 2>&1 && HAVE_PIPX=1
+HAVE_CURL=0;       command -v curl        >/dev/null 2>&1 && HAVE_CURL=1
+HAVE_UV=0;         command -v uv          >/dev/null 2>&1 && HAVE_UV=1
+HAVE_PIPCOMPILE=0; command -v pip-compile >/dev/null 2>&1 && HAVE_PIPCOMPILE=1
+
+RESOLVER=""
+if   (( HAVE_UV ));         then RESOLVER="uv pip compile"
+elif (( HAVE_PIPCOMPILE )); then RESOLVER="pip-compile"
+fi
+
+############################
+# guided setup
+############################
+#
+# Anything not fixed on the command line is asked here, so a bare
+# `bash scan-for-package.sh` walks through all settings. Non-TTY runs
+# and -y/--yes just take the defaults (or the flags that were given).
+
+guided_setup() {
+    (( ASSUME_YES )) && return 0
+    [[ -t 0 ]] || return 0
+    if (( MODE_SET && ROOT_SET && REGISTRY_SET && PIPCOMPILE_SET )); then
+        return 0
+    fi
+    local ans
+    title "Setup  (Enter = default; every question can be fixed via a flag, see --help)"
+    if (( ! MODE_SET )); then
+        read -rp "  Ecosystems to scan - [n]pm, [p]ython, or [B]oth: " ans
+        case "$(trim "$ans")" in
+            n|N|npm)                  MODE=npm ;;
+            p|P|py|pypi|PyPI|python) MODE=python ;;
+            *)                        MODE=both ;;
+        esac
+    fi
+    if (( ! ROOT_SET )); then
+        read -rp "  Filesystem root to scan [${SEARCH_ROOT}]: " ans
+        ans="$(trim "$ans")"
+        if [[ -n "$ans" ]]; then
+            if [[ -d "$ans" ]]; then
+                SEARCH_ROOT="$ans"
+            else
+                warn "not a directory: '$ans' - keeping ${SEARCH_ROOT}"
+            fi
+        fi
+    fi
+    if (( ! REGISTRY_SET )); then
+        read -rp "  Online npm/PyPI fix-version lookup (network)? [Y/n]: " ans
+        case "$(trim "$ans")" in n|N|no|NO) NO_REGISTRY=1 ;; esac
+    fi
+    if [[ "$MODE" != "npm" ]] && (( ! PIPCOMPILE_SET )) && [[ -n "$RESOLVER" ]]; then
+        read -rp "  Resolve requirements files with ${RESOLVER} to catch transitive deps (network)? [Y/n]: " ans
+        case "$(trim "$ans")" in n|N|no|NO) NO_PIPCOMPILE=1 ;; esac
+    fi
+}
+guided_setup
+
+# absolute root -> hit paths (and the exported update script) work from anywhere
+SEARCH_ROOT="$(readlink -f "$SEARCH_ROOT" 2>/dev/null || printf '%s' "$SEARCH_ROOT")"
 
 prereq_notice() {
     local missing=()
@@ -312,6 +402,29 @@ prereq_notice() {
         local joined; printf -v joined '%s, ' "${missing[@]}"; joined="${joined%, }"
         printf '  %s(optional tools missing: %s - install them for fuller results)%s\n' \
             "$DIM" "$joined" "$RESET"
+    fi
+    if [[ "$MODE" != "npm" ]]; then
+        echo
+        printf '  %sPython requirements note:%s a plain requirements.txt usually pins only\n' "$BOLD" "$RESET"
+        printf '  TOP-LEVEL packages - vulnerable transitive dependencies are invisible in\n'
+        printf '  it unless it was generated with pip-compile/uv (fully locked).\n'
+        if [[ -z "$RESOLVER" ]]; then
+            printf '  %s-> neither uv nor pip-compile found: transitive deps declared by\n' "$YELLOW"
+            printf '     requirements files will NOT be checked. Recommended: install uv\n'
+            printf '     (fast) or pip-tools (pip install pip-tools), then re-run.%s\n' "$RESET"
+        elif (( NO_PIPCOMPILE )); then
+            printf '  %s-> %s available, but resolution is disabled (--no-pip-compile or setup choice).%s\n' \
+                "$YELLOW" "$RESOLVER" "$RESET"
+        elif (( NO_REGISTRY )); then
+            printf '  %s-> resolution needs the network and --no-registry was given - skipped.%s\n' \
+                "$YELLOW" "$RESET"
+        else
+            printf '  %s-> %s found: each requirements file will additionally be resolved\n' "$GREEN" "$RESOLVER"
+            printf '     to its full dependency tree and the pinned result scanned too.%s\n' "$RESET"
+            printf '  %s   (resolving fetches package metadata from PyPI - scan trusted files only;\n' "$DIM"
+            printf '      hits found only in the resolved tree mean "a fresh install WOULD pull\n'
+            printf '      this", not that it is currently installed)%s\n' "$RESET"
+        fi
     fi
 }
 
@@ -762,6 +875,7 @@ do_walk() {
             -name yarn.lock -o \
             -name package.json -o \
             -name 'requirements*.txt' -o \
+            -name 'requirements*.in' -o \
             -name pyproject.toml -o \
             -name Pipfile -o \
             -name Pipfile.lock -o \
@@ -1399,6 +1513,163 @@ py_manifest_check() {
     done
 }
 
+# --- requirements resolution (transitive deps) ---------------------------
+# A plain requirements.txt lists only top-level deps. Resolving it with
+# `uv pip compile` (fast, preferred) or `pip-compile` yields the FULL pinned
+# tree, so vulnerable transitive deps become visible. Output goes to a temp
+# dir only - project files are never touched. Resolution reflects what a
+# fresh install would fetch TODAY, which may differ from the installed state
+# (the installed state is covered by the site-packages / pip-show scans).
+
+resolve_requirements() { # src dst -> 0 on success (dst holds pinned tree;
+                         # on failure dst.err holds the resolver's stderr)
+    local src="$1" dst="$2"
+    local dir="${src%/*}" base="${src##*/}"
+    [[ "$dir" == "$src" ]] && dir="."
+    # run inside the file's dir so '-r other.txt' / '-c ...' includes resolve
+    if (( HAVE_UV )); then
+        if ( cd "$dir" 2>/dev/null && \
+             timeout 90 uv pip compile -q --no-header --no-annotate "$base" \
+           ) > "$dst" 2>"$dst.err" && [[ -s "$dst" ]]; then
+            return 0
+        fi
+    fi
+    if (( HAVE_PIPCOMPILE )); then
+        if ( cd "$dir" 2>/dev/null && \
+             timeout 300 pip-compile -q --no-header --no-annotate -o - "$base" \
+           ) > "$dst" 2>>"$dst.err" && [[ -s "$dst" ]]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+resolve_fail_reason() { # errfile -> one short human line on stdout
+    local lines l1 l2
+    lines="$(grep -vE '^[[:space:]]*$' -- "$1" 2>/dev/null | head -2 \
+        | sed -E 's/^[^A-Za-z0-9]+//; s/^(error|ERROR):[[:space:]]*//')"
+    l1="$(printf '%s\n' "$lines" | sed -n 1p)"
+    l2="$(printf '%s\n' "$lines" | sed -n 2p)"
+    # only pull in the continuation line when the first one is a lead-in
+    # ("No solution found when resolving dependencies:")
+    [[ "$l1" == *: && -n "$l2" ]] && l1="$l1 $l2"
+    printf '%s' "${l1:0:160}"
+}
+
+# Package-manager caches, vendored test data etc. are not real projects -
+# resolving their requirements files is pointless (and often impossible).
+# They still get the normal top-level manifest scan, only resolution skips.
+is_cache_requirements() {
+    case "$1" in
+        */miniconda*/pkgs/*|*/anaconda*/pkgs/*|*/conda/pkgs/*|*/mamba*/pkgs/*|\
+        */.cache/*|*/.venv/*|*/venv/lib/*|*/virtualenvs/*|*/.tox/*|*/.nox/*|\
+        */info/test/*|*/.eggs/*|*/vendor/*|*/vendored/*)
+            return 0 ;;
+    esac
+    return 1
+}
+
+scan_resolved_file() { # orig_file compiled_file
+    local f="$1" rf="$2" idx v ver
+    for idx in "${!PKG_NAMES[@]}"; do
+        if [[ "${PKG_MODES[$idx]}" == "contains" ]]; then
+            if grep -Fqi -- "${PKG_NEEDLES[$idx]}" "$rf" 2>/dev/null; then
+                found "$idx" "python resolved ref" "$f" ""
+            fi
+            continue
+        fi
+        local variants=() gate=()
+        IFS=' ' read -ra variants <<<"${PKG_VARIANTS[$idx]}"
+        for v in "${variants[@]}"; do gate+=( -e "$v" ); done
+        grep -Fqi "${gate[@]}" -- "$rf" 2>/dev/null || continue
+        for v in "${variants[@]}"; do
+            ver="$(req_versions "$rf" "$v" | ver_list_join)"
+            [[ -z "$ver" ]] && continue
+            if grep -Fqi "${gate[@]}" -- "$f" 2>/dev/null; then
+                # also listed top-level - the manifest scan saw it; this
+                # adds the concretely resolved pin
+                found "$idx" "python resolved pin" "$f" "$ver"
+            else
+                found "$idx" "python resolved transitive" \
+                    "$f"$'\n'"(transitive dep - not listed in ${f##*/} itself; a fresh 'pip install -r' TODAY would pull this version. Whether it is currently installed is covered by the site-packages/pip scan.)" \
+                    "$ver"
+            fi
+            break
+        done
+    done
+}
+
+resolve_and_scan_requirements() {
+    local reqs=() f
+    for f in "${PY_MANIFESTS[@]+"${PY_MANIFESTS[@]}"}"; do
+        case "${f##*/}" in requirements*.txt|requirements*.in) reqs+=("$f") ;; esac
+    done
+    (( ${#reqs[@]} == 0 )) && return
+    if (( NO_PIPCOMPILE )); then
+        log "requirements resolution skipped (--no-pip-compile)"
+        return
+    fi
+    if (( NO_REGISTRY )); then
+        log "requirements resolution skipped (needs network, --no-registry given)"
+        return
+    fi
+    if [[ -z "$RESOLVER" ]]; then
+        warn "neither uv nor pip-compile found - ${#reqs[@]} requirements file(s) scanned as written only; transitive deps NOT checked (install uv or pip-tools)"
+        return
+    fi
+    log "Resolving ${#reqs[@]} requirements file(s) with ${RESOLVER} (full dependency tree)..."
+    local total=${#reqs[@]} i=0 out ndeps npinned label
+    for f in "${reqs[@]}"; do
+        ((i++)) || true
+        if is_cache_requirements "$f"; then
+            REQ_SKIPPED_CACHE=$(( REQ_SKIPPED_CACHE + 1 ))
+            continue
+        fi
+        # already a pip-compile/uv lockfile -> fully pinned, the normal
+        # manifest scan already sees everything; no need to re-resolve
+        if head -5 -- "$f" 2>/dev/null | grep -qiE 'autogenerated by (pip-compile|uv)'; then
+            REQ_ALREADY_PINNED=$(( REQ_ALREADY_PINNED + 1 ))
+            continue
+        fi
+        # top-level dep count (non-comment/-option lines) -> honest feedback
+        # while the resolver works; big trees can take a while and would
+        # otherwise look like a hang
+        ndeps="$(grep -cvE '^[[:space:]]*(#|-|$)' -- "$f" 2>/dev/null)"
+        [[ "$ndeps" =~ ^[0-9]+$ ]] || ndeps=0
+        label="[$i/$total] ${f##*/}: ${ndeps} top-level dep(s), resolving full tree"
+        (( ndeps >= 15 )) && label+=" - big file, this can take a while"
+        spinner_start "$label"
+        out="$RESOLVE_TMP/resolved-$i.txt"
+        if resolve_requirements "$f" "$out"; then
+            spinner_stop
+            REQ_RESOLVED=$(( REQ_RESOLVED + 1 ))
+            npinned="$(grep -cE '==' -- "$out" 2>/dev/null)"
+            printf '  %s[%d/%d] %s: %s top-level dep(s) -> %s package(s) in the full tree%s\n' \
+                "$DIM" "$i" "$total" "$f" "$ndeps" "${npinned:-?}" "$RESET"
+            scan_resolved_file "$f" "$out"
+        else
+            spinner_stop
+            REQ_RESOLVE_FAILED=$(( REQ_RESOLVE_FAILED + 1 ))
+            RESOLVE_FAILED_LIST+=("$f"$'\t'"$(resolve_fail_reason "$out.err")")
+        fi
+    done
+    clear_line
+    ok "requirements resolution complete (${REQ_RESOLVED} resolved, ${REQ_RESOLVE_FAILED} failed, ${REQ_ALREADY_PINNED} already pinned, ${REQ_SKIPPED_CACHE} cache/vendored skipped)"
+    if (( REQ_RESOLVE_FAILED > 0 )); then
+        warn "${REQ_RESOLVE_FAILED} requirements file(s) could NOT be resolved - their transitive deps remain unchecked (top-level deps were still scanned):"
+        local entry reason
+        for entry in "${RESOLVE_FAILED_LIST[@]}"; do
+            f="${entry%%$'\t'*}"
+            reason="${entry#*$'\t'}"
+            [[ "$reason" == "$entry" ]] && reason=""
+            printf '       %s%s%s\n' "$DIM" "$f" "$RESET"
+            [[ -n "$reason" ]] && printf '         %s-> %s%s\n' "$YELLOW" "$reason" "$RESET"
+        done
+        printf '  %s(common causes: old pins that no longer resolve together, missing local\n' "$DIM"
+        printf '   path/-e packages, private indexes needing auth - fix or ignore per file)%s\n' "$RESET"
+    fi
+}
+
 check_python() {
     title "Phase 3  -  Python"
     local idx py out ver detail pkg pkg_re
@@ -1462,6 +1733,8 @@ check_python() {
         clear_line
         ok "python manifest scan complete"
     fi
+
+    resolve_and_scan_requirements
 }
 
 ############################
@@ -1499,6 +1772,13 @@ printf '  %s%-16s%s %ds\n' "$DIM" "Duration:" "$RESET" "$dur"
 printf '  %s%-16s%s %d items (%d node_modules, %d npm manifests, %d site-packages, %d python manifests)\n' \
     "$DIM" "Scanned:" "$RESET" "$total_scanned" \
     "$NM_SCANNED" "$NPM_MAN_SCANNED" "$SP_SCANNED" "$PY_MAN_SCANNED"
+if (( REQ_RESOLVED + REQ_RESOLVE_FAILED + REQ_ALREADY_PINNED + REQ_SKIPPED_CACHE > 0 )); then
+    res_col="$DIM"
+    (( REQ_RESOLVE_FAILED > 0 )) && res_col="$YELLOW"
+    printf '  %s%-16s%s %s%d requirements file(s) resolved to full trees (%s), %d already pinned, %d cache/vendored skipped, %d FAILED (transitive deps unchecked)%s\n' \
+        "$DIM" "Resolved:" "$RESET" "$res_col" \
+        "$REQ_RESOLVED" "${RESOLVER:-n/a}" "$REQ_ALREADY_PINNED" "$REQ_SKIPPED_CACHE" "$REQ_RESOLVE_FAILED" "$RESET"
+fi
 echo
 printf '  %s%-22s %6s %6s %6s %8s %6s%s\n' "$BOLD" "Package" "hits" "VULN" "OK" "UNKNOWN" "INFO" "$RESET"
 for idx in "${!PKG_NAMES[@]}"; do
@@ -1938,7 +2218,7 @@ GEN
 
         declare -A emitted=()
         declare -A audit_roots=()     # npm project roots -> get an optional audit pass at the end
-        local idx verdict cat det ver pkg eco fixver key root mgr interp
+        local idx verdict cat det ver pkg eco fixver key root mgr interp reqfile
 
         is_managed_path() {  # caches / app bundles - npm install there is wrong
             case "$1" in
@@ -2080,6 +2360,20 @@ GEN
                 "python manifest ref")
                     printf '# manifest %s references %s (declared: %s)\n' "$det" "$pkg" "${ver:-?}"
                     printf '# bump the pin to >=%s there, then reinstall the environment.\n\n' "$fixver"
+                    ;;
+                "python resolved pin"|"python resolved transitive"|"python resolved ref")
+                    reqfile="${det%% ; *}"
+                    key2="q:$reqfile:$regname:$fixver"
+                    [[ -n "${emitted[$key2]:-}" ]] && continue
+                    emitted[$key2]=1
+                    printf '# resolving %s pins %s at v%s\n' "$reqfile" "$pkg" "${ver:-?}"
+                    if [[ "$cat" == "python resolved transitive" ]]; then
+                        printf '# (transitive - not listed in the file itself; this is what a FRESH\n'
+                        printf '#  install would pull, the currently installed version may differ)\n'
+                    fi
+                    printf '# fix: add/bump a top-level constraint "%s>=%s" in %s\n' "$regname" "$fixver" "$reqfile"
+                    printf '# (or a constraints file), re-resolve with uv pip compile / pip-compile,\n'
+                    printf '# then reinstall the environment.\n\n'
                     ;;
             esac
         done < "$HITS_FILE"
