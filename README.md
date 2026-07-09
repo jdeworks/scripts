@@ -154,34 +154,39 @@ The bot uses an **adaptive polling interval**: it first issues a cheap GitHub AP
 
 ### [`install-agent-instruct.sh`](./install-agent-instruct.sh)
 
-Distributes reusable **agent instruction** snippets — small pieces of global guidance you want every coding agent to follow — into whatever agents are installed on the machine, using each tool's own global-instructions mechanism. The snippets live in [`agents/`](./agents) and are catalogued in [`agents/manifest.tsv`](./agents/manifest.tsv); the first one is **model routing** (which model to reach for on delegated work).
+Distributes reusable **agent instruction** snippets — small pieces of global guidance you want every coding agent to follow — into whatever agents are installed on the machine, using each tool's own global-instructions mechanism. The snippets live in [`agents/`](./agents) and are catalogued in [`agents/manifest.tsv`](./agents/manifest.tsv). Two ship today: **model routing** (which model to reach for on delegated work) and the **planning protocol** (`PLANNING.md`, a trigger that points to the fuller `PLANNER.md`).
 
 It detects the agents present and wires the chosen instruction in:
 
 - **Claude Code** — copies the snippet into `~/.claude/` and adds an `@file` import to `~/.claude/CLAUDE.md`.
 - **Codex** / **opencode** — inlines the snippet into the tool's global `AGENTS.md` (`~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`).
-- Tools with **no global-instructions concept** (e.g. **Cursor**, whose rules are per-project `.cursor/rules/*.mdc`) are reported plainly and skipped — never silently dropped.
+- **Cursor** keeps its User Rules in the app rather than a file, so the detected-agent run reports it and moves on. Use `--cursor-project <dir>` to install into a repo's `.cursor/rules/` as an always-applied `.mdc` rule.
 
-It never wraps anything in a managed block. Idempotency is a plain presence check: an instruction counts as installed if its addition is already in the file, so it's never duplicated — not on a re-run, and not when the same line is already there by other means (e.g. your `~/.claude/CLAUDE.md` already `@`-importing `MODEL_ROUTING.md`). For Claude the addition is a single `@MODEL_ROUTING.md` import line; for Codex/opencode it's the snippet's verbatim content, matched by its heading. `--uninstall` removes exactly that (and, for Claude, deletes the copied file). Every file is backed up (timestamped `.agent-instruct.bak-*`) before any edit, and `--uninstall` prints a ready-to-paste `cp …` revert recipe so you can restore the pre-uninstall state if you removed something you wanted to keep.
+**Companion files.** A manifest row can list `extras` — companion files copied into each agent's config dir as on-demand reads, alongside the wired-in trigger. This keeps a large "full protocol" out of the always-loaded context: the trigger stays small and imports/inlines, and the agent Reads the companion only when it needs the detail. A snippet points at its companion with the `{{CONFIG_DIR}}` token, which the installer replaces with that agent's config dir at install time (an absolute path for a global agent, `.` for a Cursor rule) so the reference resolves on each tool. The planning instruction uses this: `PLANNING.md` is the trigger, `PLANNER.md` the companion.
 
-Installed/imported snippet files are always named in the `UPPERCASE_WITH_UNDERSCORES.md` convention (e.g. `MODEL_ROUTING.md`) — the installer enforces this regardless of what the manifest says. That keeps a single canonical filename across machines, so the `@MODEL_ROUTING.md` it would add is the *same* line you may already have, and the presence check simply leaves it alone.
+**Idempotency and backups.** An instruction counts as installed when its addition is already in the target file, so a re-run leaves things as they are — as does content you already have by other means (e.g. a `~/.claude/CLAUDE.md` that already `@`-imports `MODEL_ROUTING.md`). For Claude the addition is a single `@NAME.md` import line; for Codex/opencode it's the snippet's rendered content, matched by its heading. `--uninstall` removes that addition and the companion/copied files. Each file is backed up (timestamped `.agent-instruct.bak-*`) before an edit, and `--uninstall` prints a `cp …` revert recipe.
 
-Because there are no markers, editing an inline (Codex/opencode) snippet's content in the repo and re-running is a no-op while its heading is still present — to refresh a changed inline snippet, `--uninstall` then reinstall. Claude imports refresh automatically, since the content lives in the copied `MODEL_ROUTING.md` file (always rewritten when it differs) and the import line never changes.
+**Symlinked targets.** When a target snippet/companion file is a symlink (e.g. one your dotfiles manage), the installer leaves it as-is and reports it, so a stow/dotfiles setup stays the source of truth on that machine while other agents still get the instruction.
+
+Snippet files use the `UPPERCASE_WITH_UNDERSCORES.md` convention (e.g. `MODEL_ROUTING.md`); the installer enforces it regardless of the manifest spelling, so the same canonical filename — and the same `@NAME.md` import line — is used across machines.
+
+Refreshing content: Claude imports pick up a changed snippet automatically (the copied file is rewritten when it differs). For an inline (Codex/opencode) snippet, `--uninstall` then reinstall to replace the appended block.
 
 Usage:
 
 ```
 ./install-agent-instruct.sh                     # help + what's available + detected agents
-./install-agent-instruct.sh model-routing       # install into every detected agent
+./install-agent-instruct.sh planning            # install into every detected agent
 ./install-agent-instruct.sh --agents claude model-routing
+./install-agent-instruct.sh --cursor-project ~/repos/foo planning
 ./install-agent-instruct.sh -a -y               # install everything, no prompt
-./install-agent-instruct.sh -n model-routing    # dry-run: show the plan, write nothing
-./install-agent-instruct.sh -u model-routing    # uninstall
+./install-agent-instruct.sh -n planning         # dry-run: show the plan, write nothing
+./install-agent-instruct.sh -u planning         # uninstall
 ```
 
-Options: `-l/--list`, `-a/--all`, `--agents a,b,c`, `-n/--dry-run`, `-y/--yes`, `-u/--uninstall`, `--version`.
+Options: `-l/--list`, `-a/--all`, `--agents a,b,c`, `--cursor-project DIR`, `-n/--dry-run`, `-y/--yes`, `-u/--uninstall`, `--version`.
 
-**Adding a new instruction:** drop `agents/NAME.md` next to the manifest (uppercase + underscores, e.g. `MODEL_ROUTING.md`) and add one tab-separated row (`slug`, `basename`, `title`, `description`) to `agents/manifest.tsv` whose `basename` matches the file. Nothing else to change. To support a new agent, add an entry to the `AGENT_ORDER` / `AG_*` registry near the top of the script (the single place tool paths and install styles are defined).
+**Adding a new instruction:** drop `agents/NAME.md` next to the manifest (uppercase + underscores, e.g. `MODEL_ROUTING.md`) and add one tab-separated row to `agents/manifest.tsv` (`slug`, `basename`, `title`, `description`, and an optional `extras` column listing companion files) whose `basename` matches the file. Add any companion files the same way and name them in `extras`. To support a new agent, add an entry to the `AGENT_ORDER` / `AG_*` registry near the top of the script (the single place tool paths and install styles are defined).
 
 ## Archive
 

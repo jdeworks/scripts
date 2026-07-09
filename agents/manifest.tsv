@@ -8,9 +8,15 @@
 #                this, so a re-run always targets the same file (no lowercase dupes).
 #   title        short human label shown by --list
 #   description  one-line summary shown by --list
+#   extras       OPTIONAL comma-separated companion basenames (e.g. PLANNER.md).
+#                Copied into each agent's config dir as on-demand files — never
+#                imported or inlined. A snippet references one via the {{CONFIG_DIR}}
+#                token, which the installer renders to the agent's config dir.
 #
 # To add a new instruction: drop agents/NAME.md next to this file (uppercase +
-# underscores) and add one row whose basename matches it exactly.
+# underscores) and add one row whose basename matches it exactly. Add companion
+# files the same way and list their basenames in the extras column.
 #
-# slug	basename	title	description
+# slug	basename	title	description	extras
 model-routing	MODEL_ROUTING.md	Model routing	Which model to pick for each delegated/agent task
+planning	PLANNING.md	Planning protocol	How to produce a validated, execution-ready plan	PLANNER.md
