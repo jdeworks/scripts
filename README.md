@@ -152,6 +152,37 @@ Set in `~/.auto-issue.env` or the environment. Defaults in **bold**.
 
 The bot uses an **adaptive polling interval**: it first issues a cheap GitHub API probe (`since=<last-check>`) to see if any issues changed. If nothing changed it backs off exponentially (up to `INTERVAL_MAX` minutes); as soon as work is detected or done the sleep resets to `INTERVAL_MIN`. State (last-check timestamp, per-repo action counts) lives in `~/.auto-issue/state/`. Claude runs unattended with `--permission-mode bypassPermissions`; only point it at repos you trust it to modify.
 
+### [`install-agent-instruct.sh`](./install-agent-instruct.sh)
+
+Distributes reusable **agent instruction** snippets — small pieces of global guidance you want every coding agent to follow — into whatever agents are installed on the machine, using each tool's own global-instructions mechanism. The snippets live in [`agents/`](./agents) and are catalogued in [`agents/manifest.tsv`](./agents/manifest.tsv); the first one is **model routing** (which model to reach for on delegated work).
+
+It detects the agents present and wires the chosen instruction in:
+
+- **Claude Code** — copies the snippet into `~/.claude/` and adds an `@file` import to `~/.claude/CLAUDE.md`.
+- **Codex** / **opencode** — inlines the snippet into the tool's global `AGENTS.md` (`~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`).
+- Tools with **no global-instructions concept** (e.g. **Cursor**, whose rules are per-project `.cursor/rules/*.mdc`) are reported plainly and skipped — never silently dropped.
+
+It never wraps anything in a managed block. Idempotency is a plain presence check: an instruction counts as installed if its addition is already in the file, so it's never duplicated — not on a re-run, and not when the same line is already there by other means (e.g. your `~/.claude/CLAUDE.md` already `@`-importing `MODEL_ROUTING.md`). For Claude the addition is a single `@MODEL_ROUTING.md` import line; for Codex/opencode it's the snippet's verbatim content, matched by its heading. `--uninstall` removes exactly that (and, for Claude, deletes the copied file). Every file is backed up (timestamped `.agent-instruct.bak-*`) before any edit, and `--uninstall` prints a ready-to-paste `cp …` revert recipe so you can restore the pre-uninstall state if you removed something you wanted to keep.
+
+Installed/imported snippet files are always named in the `UPPERCASE_WITH_UNDERSCORES.md` convention (e.g. `MODEL_ROUTING.md`) — the installer enforces this regardless of what the manifest says. That keeps a single canonical filename across machines, so the `@MODEL_ROUTING.md` it would add is the *same* line you may already have, and the presence check simply leaves it alone.
+
+Because there are no markers, editing an inline (Codex/opencode) snippet's content in the repo and re-running is a no-op while its heading is still present — to refresh a changed inline snippet, `--uninstall` then reinstall. Claude imports refresh automatically, since the content lives in the copied `MODEL_ROUTING.md` file (always rewritten when it differs) and the import line never changes.
+
+Usage:
+
+```
+./install-agent-instruct.sh                     # help + what's available + detected agents
+./install-agent-instruct.sh model-routing       # install into every detected agent
+./install-agent-instruct.sh --agents claude model-routing
+./install-agent-instruct.sh -a -y               # install everything, no prompt
+./install-agent-instruct.sh -n model-routing    # dry-run: show the plan, write nothing
+./install-agent-instruct.sh -u model-routing    # uninstall
+```
+
+Options: `-l/--list`, `-a/--all`, `--agents a,b,c`, `-n/--dry-run`, `-y/--yes`, `-u/--uninstall`, `--version`.
+
+**Adding a new instruction:** drop `agents/NAME.md` next to the manifest (uppercase + underscores, e.g. `MODEL_ROUTING.md`) and add one tab-separated row (`slug`, `basename`, `title`, `description`) to `agents/manifest.tsv` whose `basename` matches the file. Nothing else to change. To support a new agent, add an entry to the `AGENT_ORDER` / `AG_*` registry near the top of the script (the single place tool paths and install styles are defined).
+
 ## Archive
 
 Older scripts kept for reference. Not actively maintained.

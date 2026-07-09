@@ -1,0 +1,16 @@
+# Catalogue of installable agent instructions, read by install-agent-instruct.sh.
+# Tab-separated. Blank lines and lines starting with '#' are ignored.
+#
+# Columns (TAB-separated):
+#   slug         short id, used on the CLI and in the managed-block markers
+#   basename     the snippet file in agents/, and the name it is copied/imported
+#                as. ALWAYS UPPERCASE_WITH_UNDERSCORES.md — the installer enforces
+#                this, so a re-run always targets the same file (no lowercase dupes).
+#   title        short human label shown by --list
+#   description  one-line summary shown by --list
+#
+# To add a new instruction: drop agents/NAME.md next to this file (uppercase +
+# underscores) and add one row whose basename matches it exactly.
+#
+# slug	basename	title	description
+model-routing	MODEL_ROUTING.md	Model routing	Which model to pick for each delegated/agent task
