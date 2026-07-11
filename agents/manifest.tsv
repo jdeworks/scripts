@@ -12,12 +12,18 @@
 #                Copied into each agent's config dir as on-demand files — never
 #                imported or inlined. A snippet references one via the {{CONFIG_DIR}}
 #                token, which the installer renders to the agent's config dir.
+#   flags        OPTIONAL comma-separated flags. `personal` = the snippet encodes
+#                this repo author's own conventions (branches, commit style, …):
+#                tagged in --list, skipped by --all, review note when installed
+#                by name. If a row has flags but no extras, put `-` in the extras
+#                column (bash read collapses consecutive tabs, so a truly empty
+#                middle column would shift the flags left).
 #
 # To add a new instruction: drop agents/NAME.md next to this file (uppercase +
 # underscores) and add one row whose basename matches it exactly. Add companion
 # files the same way and list their basenames in the extras column.
 #
-# slug	basename	title	description	extras
+# slug	basename	title	description	extras	flags
 model-routing	MODEL_ROUTING.md	Model routing	Which model to pick for each delegated/agent task
 planning	PLANNING.md	Planning protocol	How to produce a validated, execution-ready plan	PLANNER.md
-git-conventions	GIT_CONVENTIONS.md	Git conventions	Branch conventions: dev is the default and primary branch, never main
+git-conventions	GIT_CONVENTIONS.md	Git conventions	Personal git conventions: branches, commit style, hooks/local CI	-	personal

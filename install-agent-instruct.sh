@@ -20,6 +20,12 @@
 # renders to that agent's absolute config dir at install time (tilde/relative
 # refs are unreliable across tools; an absolute path always resolves).
 #
+# A manifest row may carry flags in a `flags` column. The only flag today is
+# `personal`: the snippet encodes the author's own conventions (branch names,
+# commit style, …) rather than generally applicable guidance. Personal rows are
+# tagged in --list, skipped by --all, and print a review note when installed by
+# name — adapt them before installing on someone else's machine.
+#
 # Cursor has no global instructions *file* (its User Rules live in-app); use
 # `--cursor-project <dir>` to install into a repo's .cursor/rules/ instead.
 #
@@ -33,7 +39,7 @@
 
 set -uEo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
@@ -133,21 +139,27 @@ enforce_caps() { # <name[.md]> -> UPPER_UNDERSCORE.md
   printf '%s.md' "${n^^}"
 }
 
-# Look up a slug; on success sets M_SLUG/M_BASENAME/M_TITLE/M_DESC/M_EXTRAS and
-# returns 0. M_BASENAME is normalized to the canonical uppercase form; M_EXTRAS is
-# the raw comma-separated companion list (may be empty). Read vars are local so
-# they never clobber a caller's loop variables.
+# Look up a slug; on success sets M_SLUG/M_BASENAME/M_TITLE/M_DESC/M_EXTRAS/
+# M_FLAGS and returns 0. M_BASENAME is normalized to the canonical uppercase form;
+# M_EXTRAS is the raw comma-separated companion list and M_FLAGS the raw
+# comma-separated flag list (either may be empty). Read vars are local so they
+# never clobber a caller's loop variables.
 manifest_lookup() {
-  local want="$1" _slug _base _title _desc _extras
-  while IFS=$'\t' read -r _slug _base _title _desc _extras; do
+  local want="$1" _slug _base _title _desc _extras _flags
+  while IFS=$'\t' read -r _slug _base _title _desc _extras _flags; do
     if [[ "$_slug" == "$want" ]]; then
+      [[ "$_extras" == "-" ]] && _extras=""   # `-` = empty placeholder column
       M_SLUG="$_slug"; M_TITLE="$_title"; M_DESC="$_desc"; M_EXTRAS="$_extras"
+      M_FLAGS="$_flags"
       M_BASENAME="$(enforce_caps "${_base:-$_slug.md}")"
       return 0
     fi
   done < <(manifest_rows)
   return 1
 }
+
+# True if a raw comma-separated flag list (arg 1) contains the flag (arg 2).
+has_flag() { [[ ",${1// /}," == *",$2,"* ]]; }
 
 snippet_path() { printf '%s/%s' "$AGENTS_DIR" "${1:-}"; }
 
@@ -477,14 +489,16 @@ cursor_project_uninstall() { # <slug> <project-dir>
 # ---------------------------------------------------------------------------
 print_instructions() {
   printf '%sAvailable instructions%s (from %s):\n' "$c_bold" "$c_reset" "$(prettypath "$MANIFEST")"
-  local any=0 slug base title desc extras mark note ename ecanon
-  while IFS=$'\t' read -r slug base title desc extras; do
+  local any=0 slug base title desc extras flags mark note ename ecanon
+  while IFS=$'\t' read -r slug base title desc extras flags; do
     any=1
+    [[ "$extras" == "-" ]] && extras=""   # `-` = empty placeholder column
     mark=" "
     [[ -f "$(snippet_path "$(enforce_caps "${base:-$slug.md}")")" ]] || mark="!"
     note=""
+    has_flag "$flags" personal && note=" ${c_ylw}[personal]${c_reset}"
     if [[ -n "$extras" ]]; then
-      note="  (+ $extras)"
+      note="$note  (+ $extras)"
       local -a _ex; IFS=',' read -r -a _ex <<< "$extras"
       for ename in "${_ex[@]}"; do
         ename="${ename// /}"; [[ -z "$ename" ]] && continue
@@ -495,7 +509,8 @@ print_instructions() {
     printf '  %s %-16s %s%s\n' "$mark" "$slug" "${desc:-$title}" "$note"
   done < <(manifest_rows)
   (( any )) || printf '  (none)\n'
-  printf '  %s(a %s!%s marks a manifest row whose .md file is missing)%s\n' "$c_dim" "$c_ylw" "$c_dim" "$c_reset"
+  printf '  %s(a %s!%s marks a manifest row whose .md file is missing; %s[personal]%s = author-specific, skipped by --all)%s\n' \
+    "$c_dim" "$c_ylw" "$c_dim" "$c_ylw" "$c_dim" "$c_reset"
 }
 
 print_agents() {
@@ -526,7 +541,8 @@ ${c_bold}USAGE${c_reset}
 
 ${c_bold}OPTIONS${c_reset}
   -l, --list           List available instructions and exit
-  -a, --all            Act on every instruction in the manifest
+  -a, --all            Act on every instruction in the manifest, except
+                       [personal] ones — name those explicitly to install them
       --agents a,b,c   Restrict to these agents (default: all detected).
                        Known: ${AGENT_ORDER[*]}
       --cursor-project DIR
@@ -587,14 +603,20 @@ if (( DO_LIST )); then print_instructions; exit 0; fi
 # Resolve which slugs to act on.
 # ---------------------------------------------------------------------------
 if (( DO_ALL )); then
-  SLUGS=()
-  while IFS=$'\t' read -r slug _; do SLUGS+=("$slug"); done < <(manifest_rows)
+  SLUGS=(); SKIPPED_PERSONAL=()
+  while IFS=$'\t' read -r slug _base _title _desc _extras flags; do
+    if has_flag "$flags" personal; then SKIPPED_PERSONAL+=("$slug"); else SLUGS+=("$slug"); fi
+  done < <(manifest_rows)
+  (( ${#SKIPPED_PERSONAL[@]} )) \
+    && info "--all skips [personal] instructions: ${SKIPPED_PERSONAL[*]}  (name them explicitly to act on them)"
 fi
 (( ${#SLUGS[@]} )) || { usage; exit 0; }
 
 # Validate every slug against the manifest and its .md file up front.
 for slug in "${SLUGS[@]}"; do
   manifest_lookup "$slug" || die "unknown instruction: '$slug'  (see --list)"
+  has_flag "${M_FLAGS:-}" personal \
+    && info "'$slug' is [personal] — it encodes this repo author's own conventions; review/adapt before installing for someone else."
   [[ -f "$(snippet_path "$M_BASENAME")" ]] \
     || die "manifest lists '$slug' but its file is missing: $(prettypath "$(snippet_path "$M_BASENAME")")"
   if [[ -n "${M_EXTRAS:-}" ]]; then
