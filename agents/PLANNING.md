@@ -1,8 +1,7 @@
 # Planning — how to produce a plan
 
-Applies to every planning task (a plan, a design, a "how should we do X"). Keep it
-cheap here; the full protocol lives in `{{CONFIG_DIR}}/PLANNER.md` — Read it when you
-actually plan (it is intentionally not always-loaded so it never bloats context).
+Applies to every planning task (a plan, a design, a "how should we do X"). The full
+protocol lives in `{{CONFIG_DIR}}/PLANNER.md` — Read it when you actually plan.
 
 - **Extract first**: goal, requirements, constraints, answered questions, assumptions.
 - **Align before writing.** If the request redefines how something fundamentally
@@ -14,9 +13,9 @@ actually plan (it is intentionally not always-loaded so it never bloats context)
   unclear requirements, or significant tradeoffs.
 - **Simple** → draft + self-review → present.
 - **Complex** → write the draft to the plan file → hand it to an independent, read-only
-  reviewer subagent (or any available read-only reviewer mechanism; pick its model per
-  `MODEL_ROUTING.md`) → revise from its findings → present. This review is **mandatory**
-  for complex plans.
+  reviewer subagent (or any available read-only reviewer mechanism; pick a fitting
+  model) → revise from its findings → present. This review is **mandatory** for
+  complex plans.
 - **Always write the plan to a file**, never only inline (the UI truncates long
   messages, so an inline-only plan may be invisible to the user).
 - **Sign-off gate.** In plan mode, the built-in plan-mode sign-off *is* the gate — don't

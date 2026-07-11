@@ -20,3 +20,4 @@
 # slug	basename	title	description	extras
 model-routing	MODEL_ROUTING.md	Model routing	Which model to pick for each delegated/agent task
 planning	PLANNING.md	Planning protocol	How to produce a validated, execution-ready plan	PLANNER.md
+git-conventions	GIT_CONVENTIONS.md	Git conventions	Branch conventions: dev is the default and primary branch, never main

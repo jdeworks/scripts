@@ -1,8 +1,7 @@
 # Planning Protocol
 
 Full protocol for planning tasks. `PLANNING.md` (always loaded) is the trigger;
-this file is the detail — Read it when you actually plan. Model choices are
-delegated entirely to `MODEL_ROUTING.md`; no model is named here on purpose.
+this file is the detail.
 
 ## Purpose
 
@@ -44,8 +43,8 @@ Draft the plan → self-review it against the goal and requirements → present.
 
 1. Write the draft plan to the plan file.
 2. Spawn an independent, read-only reviewer subagent (on hosts without a dedicated
-   one, any available read-only reviewer-subagent mechanism). Pick its model per
-   `MODEL_ROUTING.md` for the task's complexity.
+   one, any available read-only reviewer-subagent mechanism). Pick a model fitting
+   the task's complexity.
 3. It **reads the draft plan file** and returns its critique as text — it never
    writes, so the review is safe even inside plan mode / any read-only guard. Hand
    it in the prompt: the original request, relevant conversation context, and the
@@ -86,5 +85,5 @@ Every complex plan contains, in order:
 - **Outside plan mode**, present the file and wait for an explicit go. A design/plan
   sign-off is **not** an execution greenlight — confirm "execute now, or keep
   planning?" before implementing.
-- The strong model plans; a lighter model implements from the approved plan (per
-  `MODEL_ROUTING.md`) to save cost.
+- The strong model plans; a lighter model implements from the approved plan to
+  save cost.
