@@ -4,6 +4,10 @@ A grab-bag of standalone scripts I reach for now and then.
 
 ## Contents
 
+### [`pages-seo/`](./pages-seo)
+
+Deterministic SEO metadata + sitemap generator/checker for static sites (GitHub Pages). Owns exactly one marker-delimited `<head>` block per page plus the sitemap; visible copy stays hand-authored. Zero dependencies, runs from any cwd against any site repo via `--config`. Originated in `jdeworks/file-viewer` (which still vendors its own copy for CI isolation); this is the canonical version driving every other Pages site's `seo.config.json`. See [`pages-seo/README.md`](./pages-seo/README.md) for the config contract and the two gotchas (static-link reachability, regex h1 audit).
+
 ### [`scan-for-package.sh`](./scan-for-package.sh)
 
 Hunts the filesystem for evidence of one or more npm / pip packages — installed dirs, manifests, lockfiles, global / site-packages. Built for chasing compromised or typosquatted dependencies: paste in an advisory and it tells you exactly which machines (and which versions) are affected.
