@@ -28,3 +28,4 @@ model-routing	MODEL_ROUTING.md	Model routing	Which model to pick for each delega
 planning	PLANNING.md	Planning protocol	How to produce a validated, execution-ready plan	PLANNER.md
 git-conventions	GIT_CONVENTIONS.md	Git conventions	Personal git conventions: branches, commit style, hooks/local CI	-	personal
 self-analysis	SELF_ANALYSIS.md	Self-analysis triggers	Learn-to-learn: records-first retros when work overruns, retracts, or repeats
+humanization	HUMANIZATION.md	Human writing rules	Writing policy for reader-facing prose: no em dashes, no filler, varied rhythm
